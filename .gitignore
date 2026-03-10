@@ -24,3 +24,5 @@ token.txt
 release.sh
 delete_tag.sh
 save_modifier.py
+release.sh
+delete_tag.sh
