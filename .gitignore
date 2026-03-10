@@ -4,19 +4,13 @@ __pycache__/
 *$py.class
 venv/
 .venv/
-
-# Project Specific (Mock Test Environments)
 mock_game_root/
 mock_prefix/
 RDR2_Toolbox/
 RDR2_Toolbox_Test/
-
-# Backups and Logs
 *.bak
 *.log
 .manifest.json
-
-# OS Specific
 .DS_Store
 Thumbs.db
 simulation_box/
@@ -24,5 +18,4 @@ token.txt
 release.sh
 delete_tag.sh
 save_modifier.py
-release.sh
-delete_tag.sh
+.env

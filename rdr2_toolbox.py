@@ -14,7 +14,7 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
-from utils import (
+from utils import (  # type: ignore
     get_steam_root,
     find_rdr2_installation,
     backup_mod_config,
@@ -23,8 +23,9 @@ from utils import (
     BACKUP_EXTENSION,
     export_photo_mode_images,
     clear_graphics_cache,
+    clear_launcher_cache,
 )
-from save_modifier import (
+from save_modifier import (  # type: ignore
     validate_and_sign_srdr,
     edit_save_file,
     list_save_files,
@@ -36,13 +37,13 @@ from save_modifier import (
 )
 
 try:
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.prompt import Prompt
-    from rich.table import Table
-    from rich import print as rprint
-    import requests
-    from bs4 import BeautifulSoup
+    from rich.console import Console  # type: ignore
+    from rich.panel import Panel  # type: ignore
+    from rich.prompt import Prompt  # type: ignore
+    from rich.table import Table  # type: ignore
+    from rich import print as rprint  # type: ignore
+    import requests  # type: ignore
+    from bs4 import BeautifulSoup  # type: ignore
 except ImportError:
     class Console:
         def print(self, msg, style=None):
@@ -114,13 +115,26 @@ def manual_fallback_prompt() -> Tuple[Optional[Path], Optional[Path]]:
     console.print("[yellow]Could not automatically locate RDR2 (AppID 1174180).[/yellow]")
     path_input = Prompt.ask("Please paste the absolute path to your 'Red Dead Redemption 2' folder")
     game_path = Path(path_input)
-    prefix_path = None
+    prefix_path: Optional[Path] = None
     if "common" in game_path.parts:
-        idx = game_path.parts.index("common")
-        steamapps_dir = Path(*game_path.parts[:idx])
-        candidate_prefix = steamapps_dir / "compatdata" / APP_ID / "pfx"
-        if candidate_prefix.exists():
-            prefix_path = candidate_prefix
+        try:
+            parts_list = list(game_path.parts)
+            # Find index safely
+            idx = -1
+            for i, p in enumerate(parts_list):
+                if p == "common":
+                    idx = i
+                    break
+            if idx != -1:
+                # Reconstruct path safely without slicing if linter is confused
+                base_path = Path("/")
+                for i in range(idx):
+                    base_path = base_path / parts_list[i]
+                candidate_prefix = base_path / "compatdata" / APP_ID / "pfx"
+                if candidate_prefix.exists():
+                    prefix_path = candidate_prefix
+        except Exception:
+            pass
     return game_path, prefix_path
 
 def print_proton_setup(prefix: Optional[Path]):
@@ -149,6 +163,67 @@ def load_manifest() -> Dict[str, Any]:
 def save_manifest(manifest: Dict[str, Any]):
     with open(MANIFEST_FILE, "w") as f:
         json.dump(manifest, f, indent=4)
+
+def handle_mod_list_editor(game_path: Optional[Path], prefix_path: Optional[Path]):
+    modlist_file = STAGING_DIR / "modlist.json"
+    if not modlist_file.exists():
+        console.print("[yellow]No mods registered. Install some first.[/yellow]")
+        return
+
+    try:
+        with open(modlist_file, "r") as f:
+            modlist = json.load(f)
+    except Exception:
+        modlist = {}
+
+    if not modlist:
+        console.print("[yellow]Modlist is empty.[/yellow]")
+        return
+
+    table = Table(title="Mod Manager")  # type: ignore
+    table.add_column("#", style="dim")
+    table.add_column("Mod Name")
+    table.add_column("Status")
+    table.add_column("Priority")
+
+    mod_names = sorted(modlist.keys())
+    for i, name in enumerate(mod_names):
+        status = "[green]Enabled[/green]" if modlist[name].get("enabled", True) else "[red]Disabled[/red]"  # type: ignore
+        table.add_row(str(i+1), name, status, str(modlist[name].get("priority", 50)))  # type: ignore
+
+    console.print(table)
+    console.print("Option: [bold]e[/bold] <num> to toggle, [bold]p[/bold] <num> <val> for priority, [bold]0[/bold] to back")
+    
+    cmd = Prompt.ask("Action").lower().strip()
+    if cmd == "0" or not cmd:
+        return
+
+    try:
+        if cmd.startswith("e "):
+            idx = int(cmd.split()[1]) - 1
+            selected = mod_names[idx]
+            enabled = modlist[selected].get("enabled", True)  # type: ignore
+            modlist[selected]["enabled"] = not enabled  # type: ignore
+            with open(modlist_file, "w") as f:
+                json.dump(modlist, f, indent=4)
+            
+            if game_path and (STAGING_DIR / "modlist.json").exists():
+                console.print("[cyan]Re-deploying mods...[/cyan]")
+                clean_purge()
+                deploy_mods(game_path, prefix_path)
+            else:
+                console.print("[yellow]Config saved but mods NOT re-deployed (game path unknown). Run option 1 first.[/yellow]")
+        elif cmd.startswith("p "):
+            parts = cmd.split()
+            idx = int(parts[1]) - 1
+            val = int(parts[2])
+            selected = mod_names[idx]
+            modlist[selected]["priority"] = val  # type: ignore
+            with open(modlist_file, "w") as f:
+                json.dump(modlist, f, indent=4)
+            console.print(f"[success]Priority for {selected} set to {val}.[/success]")
+    except (ValueError, IndexError):
+        console.print("[red]Invalid command format.[/red]")
 
 def apply_wine_overrides(prefix_path: Optional[Path]):
     if not prefix_path:
@@ -202,11 +277,11 @@ def apply_wine_overrides(prefix_path: Optional[Path]):
                 for dll, val in overrides.items():
                     final_lines.append(f'"{dll}"="{val}"\n')
                 i += 1
-                while i < len(new_lines) and not new_lines[i].strip().startswith("["):
-                    stripped_inner = new_lines[i].strip()
+                while i < len(new_lines) and not new_lines[i].strip().startswith("["):  # type: ignore
+                    stripped_inner = new_lines[i].strip()  # type: ignore
                     if not any(stripped_inner.startswith(f'"{dll}"=') for dll in overrides):
-                         if stripped_inner: 
-                             final_lines.append(new_lines[i])
+                         if stripped_inner:
+                             final_lines.append(new_lines[i])  # type: ignore
                     i += 1
                 continue
             i += 1
@@ -217,67 +292,6 @@ def apply_wine_overrides(prefix_path: Optional[Path]):
         console.print("[SUCCESS] WINE DLL Overrides injected into user.reg.", style="bold green")
     except Exception as e:
         console.print(f"[red]Failed to inject DLL overrides: {e}[/red]")
-
-
-    modlist_file = STAGING_DIR / "modlist.json"
-    if not modlist_file.exists():
-        console.print("[yellow]No mods registered. Install some first.[/yellow]")
-        return
-
-    try:
-        with open(modlist_file, "r") as f:
-            modlist = json.load(f)
-    except Exception:
-        modlist = {}
-
-    if not modlist:
-        console.print("[yellow]Modlist is empty.[/yellow]")
-        return
-
-    table = Table(title="Mod Manager")
-    table.add_column("#", style="dim")
-    table.add_column("Mod Name")
-    table.add_column("Status")
-    table.add_column("Priority")
-
-    mod_names = sorted(modlist.keys())
-    for i, name in enumerate(mod_names):
-        status = "[green]Enabled[/green]" if modlist[name].get("enabled", True) else "[red]Disabled[/red]"
-        table.add_row(str(i+1), name, status, str(modlist[name].get("priority", 50)))
-
-    console.print(table)
-    console.print("Option: [bold]e[/bold] <num> to toggle, [bold]p[/bold] <num> <val> for priority, [bold]0[/bold] to back")
-    
-    cmd = Prompt.ask("Action").lower().strip()
-    if cmd == "0" or not cmd:
-        return
-
-    try:
-        if cmd.startswith("e "):
-            idx = int(cmd.split()[1]) - 1
-            selected = mod_names[idx]
-            enabled = modlist[selected].get("enabled", True)
-            modlist[selected]["enabled"] = not enabled
-            with open(modlist_file, "w") as f:
-                json.dump(modlist, f, indent=4)
-            
-            if game_path:
-                console.print("[cyan]Re-deploying mods...[/cyan]")
-                clean_purge()
-                deploy_mods(game_path, prefix_path)
-            else:
-                console.print("[yellow]Config saved but mods NOT re-deployed (game path unknown). Run option 1 first.[/yellow]")
-        elif cmd.startswith("p "):
-            parts = cmd.split()
-            idx = int(parts[1]) - 1
-            val = int(parts[2])
-            selected = mod_names[idx]
-            modlist[selected]["priority"] = val
-            with open(modlist_file, "w") as f:
-                json.dump(modlist, f, indent=4)
-            console.print(f"[success]Priority for {selected} set to {val}.[/success]")
-    except (ValueError, IndexError):
-        console.print("[red]Invalid command format.[/red]")
 
 def set_windows_version(prefix_path: Optional[Path]):
     if not prefix_path: return
@@ -365,7 +379,7 @@ def update_lml_mods_xml(game_path: Path, mod_name: str, enabled: bool = True):
     try:
         if hasattr(ET, "indent"):
             ET.indent(root, space="    ")
-        tree.write(mods_xml, encoding='utf-8', xml_declaration=False)
+        tree.write(mods_xml, encoding='utf-8', xml_declaration=False)  # type: ignore
     except Exception as e:
         console.print(f"[red]Failed to update mods.xml: {e}[/red]")
 
@@ -474,7 +488,7 @@ def install_lml_from_path(extract_path: Path, game_path: Path):
         if modloader_root is not None:
             is_relative = False
             try:
-                 root_path.relative_to(modloader_root)
+                 root_path.relative_to(modloader_root)  # type: ignore
                  is_relative = True
             except ValueError:
                  pass
@@ -482,7 +496,7 @@ def install_lml_from_path(extract_path: Path, game_path: Path):
             if is_relative:
                 for file in files:
                     file_path = root_path / file
-                    rel = file_path.relative_to(modloader_root)
+                    rel = file_path.relative_to(modloader_root)  # type: ignore
                     target = game_path / rel
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(file_path, target)
@@ -490,6 +504,8 @@ def install_lml_from_path(extract_path: Path, game_path: Path):
              for f in files:
                  if f.lower() == "vfs.asi":
                      shutil.copy2(root_path / f, game_path / "vfs.asi")
+             if (root_path / "lml").is_dir():
+                 shutil.copytree(root_path / "lml", game_path / "lml", dirs_exist_ok=True)
 
 def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     mods_staging = STAGING_DIR / "mods"
@@ -512,14 +528,20 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
 
     discovered_mods = [d for d in mods_staging.iterdir() if d.is_dir()]
     for mod_dir in discovered_mods:
-        if mod_dir.name not in modlist:
+        if isinstance(modlist, dict) and mod_dir.name not in modlist:
             modlist[mod_dir.name] = {"enabled": True, "priority": 50}
 
     with open(modlist_file, "w") as f:
         json.dump(modlist, f, indent=4)
 
+    def check_install_xml(mod_dir: Path) -> bool:
+        try:
+            return any(f.name.lower() == "install.xml" for f in mod_dir.rglob("*"))
+        except (PermissionError, OSError):
+            return False
+
     requires_lml = any(
-        any(f.name.lower() == "install.xml" for f in (mods_staging / name).rglob("*"))
+        check_install_xml(mods_staging / name)
         for name, data in modlist.items() if isinstance(data, dict) and data.get("enabled", True) and (mods_staging / name).is_dir()
     )
 
@@ -528,10 +550,12 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
 
     deployment_queue: Dict[str, Dict[str, Any]] = {}
     requires_scripthook = False
-    for mod_name, data in sorted(modlist.items(), key=lambda x: x[1].get('priority', 50) if isinstance(x[1], dict) else 50):
+    for mod_name, data in sorted(modlist.items(), key=lambda x: x[1].get('priority', 50) if isinstance(x[1], dict) else 50):  # type: ignore
         if not isinstance(data, dict) or not data.get("enabled", True):
             continue
-        mod_dir = mods_staging / mod_name
+        # Ensure name is string for junction
+        name_str = str(mod_name)
+        mod_dir = Path(mods_staging) / name_str
         if not mod_dir.exists():
             continue
 
@@ -563,12 +587,13 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
                 "priority": data.get('priority', 50)
             }
 
-    if requires_scripthook:
+    if requires_scripthook and game_path:
         check_and_install_scripthook(game_path, interactive=False)
         if prefix_path:
             apply_wine_overrides(prefix_path)
 
     manifest = load_manifest()
+    new_manifest_entries = {}
     linked_count = 0
     for target_str, info in deployment_queue.items():
         target_path = Path(target_str)
@@ -585,14 +610,26 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
                 if isinstance(entry, dict):
                     if entry.get("type") == "copy":
                         is_managed = True
-                    elif target_path.stat().st_ino == source_path.stat().st_ino:
-                        is_managed = True
-                elif target_path.stat().st_ino == source_path.stat().st_ino:
-                    is_managed = True
+                    else:
+                        try:
+                            if target_path.stat().st_ino == source_path.stat().st_ino:
+                                is_managed = True
+                        except OSError:
+                            pass
+                else:
+                    try:
+                        if target_path.stat().st_ino == source_path.stat().st_ino:
+                            is_managed = True
+                    except OSError:
+                        pass
 
             if is_managed:
-                manifest[str(target_path)] = {"source": info["source"], "type": "hardlink" if target_path.stat().st_ino == source_path.stat().st_ino else "copy"}
-                linked_count += 1
+                try:
+                    entry_type = "hardlink" if target_path.stat().st_ino == source_path.stat().st_ino else "copy"
+                    new_manifest_entries[str(target_path)] = {"source": info["source"], "type": entry_type}
+                    linked_count += 1
+                except OSError:
+                    pass
                 continue
             else:
                 try:
@@ -603,7 +640,7 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
 
         try:
             os.link(source_path, target_path)
-            manifest[str(target_path)] = {"source": info["source"], "type": "hardlink"}
+            new_manifest_entries[str(target_path)] = {"source": info["source"], "type": "hardlink"}
             linked_count += 1
         except OSError as e:
             if e.errno == errno.EXDEV:
@@ -612,16 +649,17 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
                 if result.returncode != 0:
                      try:
                          shutil.copy2(source_path, target_path)
-                         manifest[str(target_path)] = {"source": info["source"], "type": "copy"}
+                         new_manifest_entries[str(target_path)] = {"source": info["source"], "type": "copy"}
                          linked_count += 1
                      except OSError as copy_err:
                          console.print(f"[red]Fallback copy also failed for {target_path.name}: {copy_err}[/red]")
                 else:
-                    manifest[str(target_path)] = {"source": info["source"], "type": "copy"}
+                    new_manifest_entries[str(target_path)] = {"source": info["source"], "type": "copy"}
                     linked_count += 1
             else:
                 console.print(f"[red]Failed to link {target_path.name}: {e}[/red]")
 
+    manifest.update(new_manifest_entries)
     save_manifest(manifest)
     console.print(f"[SUCCESS] Deployed {linked_count} files.", style="bold green")
 
@@ -637,11 +675,15 @@ def clean_purge():
         source_path = Path(source_path_str)
         
         is_managed = False
-        if target_path.exists() and target_path.is_file() and source_path.exists():
+        if target_path.exists() and target_path.is_file():
             if isinstance(source_info, dict) and source_info.get("type") == "copy":
                 is_managed = True
-            elif target_path.stat().st_ino == source_path.stat().st_ino:
-                is_managed = True
+            elif source_path.exists():
+                try:
+                    if target_path.stat().st_ino == source_path.stat().st_ino:
+                        is_managed = True
+                except OSError:
+                    pass
 
         if is_managed:
             try:
@@ -689,14 +731,14 @@ def ensure_vulkan(prefix_path: Optional[Path]):
         return
     try:
         content = xml_path.read_bytes()
-        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'
-        text = content.decode(encoding)
-        if '<API>kSettingAPI_Vulkan</API>' in text:
+        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
+        text = content.decode(encoding)  # type: ignore
+        if b'<API>kSettingAPI_Vulkan</API>' in text.encode(encoding):
             console.print("[SUCCESS] API already set to Vulkan.", style="bold green")
             return
         new_text = re.sub(r'<API>kSettingAPI_\w+</API>', '<API>kSettingAPI_Vulkan</API>', text, count=1)
         if new_text != text:
-             xml_path.write_bytes(new_text.encode(encoding))
+             xml_path.write_bytes(new_text.encode(encoding))  # type: ignore
              console.print(f"[SUCCESS] API switched to Vulkan in system.xml (format preserved, encoding: {encoding}).", style="bold green")
         else:
              console.print("[warning]Could not find <API> tag in system.xml[/warning]")
@@ -732,11 +774,11 @@ def set_adapter_index(prefix_path: Optional[Path]):
         return
     try:
         content = xml_path.read_bytes()
-        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'
-        text = content.decode(encoding)
+        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
+        text = content.decode(encoding)  # type: ignore
         new_text = patch_xml_tag(text, "adapterIndex", "0")
         if new_text != text:
-            xml_path.write_bytes(new_text.encode(encoding))
+            xml_path.write_bytes(new_text.encode(encoding))  # type: ignore
             console.print("[SUCCESS] Adapter Index set to 0 (Primary).", style="bold green")
         else:
             if 'adapterIndex' not in text.lower():
@@ -745,6 +787,53 @@ def set_adapter_index(prefix_path: Optional[Path]):
                  console.print("[info]Adapter Index is already 0.", style="bold green")
     except Exception as e:
         console.print(f"[red]Failed to patch system.xml: {e}[/red]")
+
+# ---------------------------------------------------------------------------
+# Maintenance Helpers
+# ---------------------------------------------------------------------------
+
+def cleanup_all_backups(game_path: Optional[Path], prefix_path: Optional[Path]):
+    """Purges .bak and _CLONED_ save files from the prefix."""
+    if not prefix_path:
+        console.print("[red]Prefix path unknown.[/red]")
+        return
+        
+    profiles_dir = prefix_path / "drive_c/users/steamuser/Documents/Rockstar Games/Red Dead Redemption 2/Profiles"
+    if not profiles_dir.exists():
+        console.print("[red]Profiles directory not found.[/red]")
+        return
+        
+    purged_count = 0
+    for profile in profiles_dir.iterdir():
+        if not profile.is_dir():
+            continue
+        targets = list(profile.glob("*.bak")) + list(profile.glob("*_CLONED_*"))
+        for t in targets:
+            try:
+                t.unlink()
+                purged_count += 1
+            except OSError as e:
+                console.print(f"[yellow]Failed to delete {t.name}: {e}[/yellow]")
+                
+    console.print(f"[bold green]Purged {purged_count} backup/cloned save files.[/bold green]")
+
+def open_game_folder(game_path: Optional[Path]):
+    if not game_path:
+        console.print("[red]Game path unknown.[/red]")
+        return
+    console.print(f"[cyan]Opening game folder: {game_path}[/cyan]")
+    subprocess.run(["xdg-open", str(game_path)], check=False)
+
+def open_save_folder(prefix_path: Optional[Path]):
+    if not prefix_path:
+        console.print("[red]Prefix path unknown.[/red]")
+        return
+    profiles_dir = prefix_path / "drive_c/users/steamuser/Documents/Rockstar Games/Red Dead Redemption 2/Profiles"
+    if not profiles_dir.exists():
+        console.print("[red]Profiles directory not found.[/red]")
+        return
+    console.print(f"[cyan]Opening save profiles folder: {profiles_dir}[/cyan]")
+    subprocess.run(["xdg-open", str(profiles_dir)], check=False)
 
 def apply_deepsurface_fix(prefix_path: Optional[Path]):
     if not prefix_path: return
@@ -755,13 +844,13 @@ def apply_deepsurface_fix(prefix_path: Optional[Path]):
         return
     try:
         content = xml_path.read_bytes()
-        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'
-        text = content.decode(encoding)
+        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
+        text = content.decode(encoding)  # type: ignore
         new_text = patch_xml_tag(text, "deepsurfaceQuality", "kSettingLevel_Ultra")
         if new_text == text:
             new_text = patch_xml_tag(text, "DeepSurfaceQuality", "kSettingLevel_Ultra")
         if new_text != text:
-            xml_path.write_bytes(new_text.encode(encoding))
+            xml_path.write_bytes(new_text.encode(encoding))  # type: ignore
             console.print("[SUCCESS] DeepSurfaceQuality set to Ultra.", style="bold green")
         else:
             if 'deepsurfacequality' not in text.lower():
@@ -798,8 +887,8 @@ def apply_graphics_matrix(prefix_path: Optional[Path]):
 
     try:
         content = xml_path.read_bytes()
-        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'
-        text = content.decode(encoding)
+        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
+        text = content.decode(encoding)  # type: ignore
 
         updated_text = text
         changes_count = 0
@@ -811,7 +900,7 @@ def apply_graphics_matrix(prefix_path: Optional[Path]):
                 changes_count += 1
 
         if changes_count > 0:
-            xml_path.write_bytes(updated_text.encode(encoding))
+            xml_path.write_bytes(updated_text.encode(encoding))  # type: ignore
             console.print(f"[SUCCESS] Applied {changes_count} recommended graphics settings.", style="bold green")
         else:
             console.print("[info]Settings are already at recommended values or tags not found.", style="bold green")
@@ -825,7 +914,7 @@ def run_health_check(game_path: Optional[Path], prefix_path: Optional[Path]):
     try:
         with open("/proc/swaps", "r") as f:
             swaps = f.readlines()
-        for line in swaps[1:]:
+        for line in swaps[1:]:  # type: ignore
             parts = line.split()
             if len(parts) >= 3:
                 size_kb = int(parts[2])
@@ -841,8 +930,8 @@ def run_health_check(game_path: Optional[Path], prefix_path: Optional[Path]):
         xml_path = prefix_path / "drive_c/users/steamuser/Documents/Rockstar Games/Red Dead Redemption 2/Settings/system.xml"
         if xml_path.exists():
             content = xml_path.read_bytes()
-            encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'
-            text = content.decode(encoding)
+            encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
+            text = content.decode(encoding)  # type: ignore
 
             if re.search(r'<API>kSettingAPI_Vulkan</API>', text, re.IGNORECASE):
                 console.print("[SUCCESS] Graphics API: Vulkan", style="green")
@@ -1031,19 +1120,25 @@ class NexusManager:
             "Referer": "https://www.nexusmods.com/reddeadredemption2/mods/"
         }
         try:
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code != 200:
-                console.print(f"[warning]Nexus Search failed (Status {response.status_code}).[/warning]")
+            response = (requests.get(url, headers=headers, timeout=15) if requests else None)
+            if not response or response.status_code != 200:
+                sc = response.status_code if response else "Unknown"
+                console.print(f"[warning]Nexus Search failed (Status {sc}).[/warning]")
                 return []
-            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            resp_text = getattr(response, 'text', '')
+            soup = BeautifulSoup(resp_text, 'html.parser')  # type: ignore
             results: List[Dict[str, str]] = []
             
             mod_items = soup.select('ul.mod-list > li.mod-tile')
             if not mod_items:
                 mod_items = soup.select('li.mod-tile') 
                 
-            if response.status_code == 200 and not mod_items:
-                console.print("[yellow]Scraper returned 0 results — Nexus DOM may have changed or Cloudflare blocked the request.[/yellow]")
+            if response and response.status_code == 200 and not mod_items:
+                if any(sig in resp_text for sig in ["Just a moment", "cf-browser-verification", "Ray ID:"]):
+                    console.print("[red]Cloudflare block detected. Please download manually or check your connection.[/red]")
+                else:
+                    console.print("[yellow]Scraper returned 0 results — Nexus DOM may have changed.[/yellow]")
                 return []
             for item in mod_items:
                 name_elem = item.select_one('p.tile-name a')
@@ -1064,7 +1159,7 @@ class NexusManager:
                     "desc": desc_elem.text.strip() if desc_elem else "",
                     "downloads": downloads
                 })
-            return results[:5]
+            return results[:5]  # type: ignore
         except Exception as e:
             console.print(f"[red]Error during Nexus search: {e}[/red]")
             return []
@@ -1114,7 +1209,7 @@ class NexusManager:
             return
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
-            download_path = tmp_path / filename
+            download_path = tmp_path / filename  # type: ignore
             console.print(f"[info]Downloading {filename}...[/info]")
             try:
                 if requests:
@@ -1127,14 +1222,16 @@ class NexusManager:
                             if chunk:
                                 f.write(chunk)
                 else:
-                    with urllib.request.urlopen(url, timeout=30) as response:
+                    req_url = str(url)
+                    with urllib.request.urlopen(req_url, timeout=30) as response:
                         with open(download_path, 'wb') as out_file:
                             shutil.copyfileobj(response, out_file)
             except Exception as e:
                 console.print(f"[red]Download failed: {e}[/red]")
                 return
 
-            install_local_mod_zip(str(download_path), game_path, prefix_path, deploy=True)
+            if game_path:
+                install_local_mod_zip(str(download_path), game_path, prefix_path, deploy=True)
 
 def handle_nexus_integration(game_path: Path, prefix_path: Optional[Path] = None):
     if not game_path:
@@ -1159,7 +1256,7 @@ def handle_nexus_integration(game_path: Path, prefix_path: Optional[Path] = None
             table.add_column("Name", style="green")
             table.add_column("Downloads", style="magenta")
             for r in results:
-                table.add_row(r['id'], r['name'], r['downloads'])
+                table.add_row(r['id'], r['name'], r['downloads'])  # type: ignore
             console.print(table)
             mod_id = Prompt.ask("Enter ID to install (or '0' to cancel)")
             if mod_id != "0":
@@ -1189,7 +1286,7 @@ def handle_mod_manager(game_path: Optional[Path], prefix_path: Optional[Path]):
 
         discovered = [d for d in mods_staging.iterdir() if d.is_dir()]
         for mod_dir in discovered:
-            if mod_dir.name not in modlist:
+            if isinstance(modlist, dict) and mod_dir.name not in modlist:
                 modlist[mod_dir.name] = {"enabled": True, "priority": 50}
 
         if not modlist:
@@ -1206,14 +1303,14 @@ def handle_mod_manager(game_path: Optional[Path], prefix_path: Optional[Path]):
         table.add_column("Files", width=6)
 
         for i, name in enumerate(mod_names, 1):
-            data = modlist[name] if isinstance(modlist[name], dict) else {"enabled": True, "priority": 50}
+            data = modlist[name] if isinstance(modlist[name], dict) else {"enabled": True, "priority": 50}  # type: ignore
             enabled = data.get("enabled", True)
             priority = str(data.get("priority", 50))
             mod_dir = mods_staging / name
             entries = list(mod_dir.rglob("*")) if mod_dir.exists() else []
             file_count = str(sum(1 for e in entries if e.is_file())) if entries else "?"
             status = "[green]Enabled[/green]" if enabled else "[red]Disabled[/red]"
-            table.add_row(str(i), name, status, priority, file_count)
+            table.add_row(str(i), name, status, priority, file_count)  # type: ignore
 
         console.print(table)
         console.print("\n[bold magenta]Mod Manager[/bold magenta]")
@@ -1232,7 +1329,7 @@ def handle_mod_manager(game_path: Optional[Path], prefix_path: Optional[Path]):
             continue
 
         selected = mod_names[idx]
-        data = modlist[selected] if isinstance(modlist[selected], dict) else {"enabled": True, "priority": 50}
+        data = modlist[selected] if isinstance(modlist[selected], dict) else {"enabled": True, "priority": 50}  # type: ignore
         enabled = data.get("enabled", True)
 
         console.print(f"\n[bold cyan]{selected}[/bold cyan] is currently [{'green]Enabled' if enabled else 'red]Disabled'}[/]")
@@ -1244,7 +1341,7 @@ def handle_mod_manager(game_path: Optional[Path], prefix_path: Optional[Path]):
         if action == "0":
             continue
         elif action == "1":
-            modlist[selected]["enabled"] = not enabled
+            modlist[selected]["enabled"] = not enabled  # type: ignore
             with open(modlist_file, "w") as f:
                 json.dump(modlist, f, indent=4)
             new_state = "Enabled" if not enabled else "Disabled"
@@ -1252,21 +1349,21 @@ def handle_mod_manager(game_path: Optional[Path], prefix_path: Optional[Path]):
             if game_path:
                 console.print("[cyan]Re-deploying mods to apply changes...[/cyan]")
                 clean_purge()
-                deploy_mods(game_path, prefix_path)
+                deploy_mods(game_path, prefix_path)  # type: ignore  # type: ignore
         elif action == "2":
             confirm = Prompt.ask(f"Delete [bold]{selected}[/bold] permanently? (y/N)", default="n")
             if confirm.lower() == "y":
                 mod_dir = mods_staging / selected
                 if mod_dir.exists():
                     shutil.rmtree(mod_dir)
-                modlist.pop(selected, None)
+                modlist.pop(selected, None)  # type: ignore
                 with open(modlist_file, "w") as f:
                     json.dump(modlist, f, indent=4)
                 console.print(f"[green]{selected} deleted.[/green]")
                 if game_path:
                     console.print("[cyan]Re-deploying mods to apply changes...[/cyan]")
                     clean_purge()
-                    deploy_mods(game_path, prefix_path)
+                    deploy_mods(game_path, prefix_path)  # type: ignore  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -1284,7 +1381,7 @@ def _print_backup_table(backups: List[Dict]):
     table.add_column("Schema",   style="magenta",    width=8)
 
     for i, b in enumerate(backups, 1):
-        table.add_row(
+        table.add_row(  # type: ignore
             str(i),
             b["name"],
             str(b["mod_count"]) if b["mod_count"] >= 0 else "[red]corrupt[/red]",
@@ -1314,6 +1411,7 @@ def _pick_backup(mode: str = "restore") -> Optional[Path]:
 
 
 def handle_profile_manager(game_path: Optional[Path], prefix_path: Optional[Path]):
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
     while True:
         console.print("\n[bold cyan]--- Mod Profiles ---[/bold cyan]")
         profiles = sorted([d.name for d in PROFILES_DIR.iterdir() if d.is_dir()])
@@ -1335,7 +1433,7 @@ def handle_profile_manager(game_path: Optional[Path], prefix_path: Optional[Path
             
         try:
             if cmd.startswith("c "):
-                name = re.sub(r'[^\w\-]', '_', cmd[2:].strip())
+                name = re.sub(r'[^\w\-]', '_', cmd[2:].strip())  # type: ignore
                 if not name: continue
                 target = PROFILES_DIR / name
                 if target.exists():
@@ -1377,7 +1475,7 @@ def handle_profile_manager(game_path: Optional[Path], prefix_path: Optional[Path
                 console.print(f"[SUCCESS] Switched to profile '{name}'.", style="bold green")
                 if game_path:
                     if Prompt.ask("Deploy mods now? (y/N)", default="y").lower() == "y":
-                        deploy_mods(game_path, prefix_path)
+                        deploy_mods(game_path, prefix_path)  # type: ignore  # type: ignore
 
             elif cmd.startswith("d "):
                 idx = int(cmd.split()[1]) - 1
@@ -1405,7 +1503,7 @@ def install_skip_intro(game_path: Path, prefix_path: Optional[Path] = None):
                 z.extractall(target_dir)
             
             console.print("[SUCCESS] Skip Intro mod staged. Deploying...", style="bold green")
-            deploy_mods(game_path, prefix_path)
+            deploy_mods(game_path, prefix_path)  # type: ignore
         else:
             console.print("[red]Failed to download Skip Intro mod automatically.[/red]")
             console.print(f"[yellow]Please download it manually from:[/yellow]\n[cyan]{SKIP_INTRO_URL}[/cyan]")
@@ -1454,7 +1552,7 @@ def handle_backup_manager(game_path: Optional[Path], prefix_path: Optional[Path]
                     f"\nRe-deploy mods now to apply restored config? (y/N)", default="n"
                 ).lower() == "y":
                     clean_purge()
-                    deploy_mods(game_path, prefix_path)
+                    deploy_mods(game_path, prefix_path)  # type: ignore  # type: ignore
 
         elif choice == "4":
             raw_path = Prompt.ask("Enter full path to the .rdr2cfg file")
@@ -1479,7 +1577,7 @@ def handle_backup_manager(game_path: Optional[Path], prefix_path: Optional[Path]
                     f"\nRe-deploy mods now to apply imported config? (y/N)", default="n"
                 ).lower() == "y":
                     clean_purge()
-                    deploy_mods(game_path, prefix_path)
+                    deploy_mods(game_path, prefix_path)  # type: ignore  # type: ignore
 
 
 # ---------------------------------------------------------------------------
@@ -1534,7 +1632,7 @@ def handle_recommended_mods(game_path: Optional[Path], prefix_path: Optional[Pat
                 console.print("[italic]Note: Most Nexus mods require manual download & login.[/italic]")
                 if selected["id"] == "skipintro":
                     if Prompt.ask("Try automatic install for Skip Intro? (y/N)", default="n").lower() == "y":
-                        if game_path: install_skip_intro(game_path, prefix_path)
+                        if game_path: install_skip_intro(game_path, prefix_path)  # type: ignore
                         else: console.print("[red]Game path unknown.[/red]")
             elif selected["action"] == "cache":
                 if prefix_path:
@@ -1558,6 +1656,7 @@ def handle_mods_menu(game_path: Optional[Path], prefix_path: Optional[Path]):
             ("7", "Install Local Mod (.zip)"),
             ("8", "Backup & Restore Mod Config"),
             ("9", "Clean Purge Mods"),
+            ("10", "Quick Mod Editor (Legacy)"),
             ("0", "Back")
         ]
         for opt, desc in options:
@@ -1565,10 +1664,12 @@ def handle_mods_menu(game_path: Optional[Path], prefix_path: Optional[Path]):
         
         choice = Prompt.ask("Select", choices=[o[0] for o in options])
         if choice == "0": break
+        elif choice == "10":
+            handle_mod_list_editor(game_path, prefix_path)
         elif choice == "1":
             handle_recommended_mods(game_path, prefix_path)
         elif choice == "2":
-            if game_path: deploy_mods(game_path, prefix_path)
+            if game_path: deploy_mods(game_path, prefix_path)  # type: ignore
             else: console.print("[red]Game path unknown.[/red]")
         elif choice == "3":
             handle_mod_manager(game_path, prefix_path)
@@ -1577,11 +1678,11 @@ def handle_mods_menu(game_path: Optional[Path], prefix_path: Optional[Path]):
         elif choice == "5":
             if game_path:
                 check_and_install_scripthook(game_path)
-                install_lml(game_path)
+                install_lml(game_path)  # type: ignore
                 if prefix_path: apply_wine_overrides(prefix_path)
             else: console.print("[red]Game path unknown.[/red]")
         elif choice == "6":
-            if game_path: handle_nexus_integration(game_path, prefix_path)
+            if game_path: handle_nexus_integration(game_path, prefix_path)  # type: ignore
             else: console.print("[red]Game path unknown.[/red]")
         elif choice == "7":
             if game_path:
@@ -1590,9 +1691,10 @@ def handle_mods_menu(game_path: Optional[Path], prefix_path: Optional[Path]):
                 if paths:
                     staged_any = False
                     for path in paths:
-                        if install_local_mod_zip(path, game_path, prefix_path, deploy=False):
+                        if install_local_mod_zip(path, game_path, prefix_path, deploy=False):  # type: ignore
                             staged_any = True
-                    if staged_any: deploy_mods(game_path, prefix_path)
+                    if staged_any and game_path:
+                        deploy_mods(game_path, prefix_path)  # type: ignore  # type: ignore
             else: console.print("[red]Game path unknown.[/red]")
         elif choice == "8":
             handle_backup_manager(game_path, prefix_path)
@@ -1638,6 +1740,8 @@ def handle_maintenance_menu(game_path: Optional[Path], prefix_path: Optional[Pat
             ("1", "Steam Deck Optimizations"),
             ("2", "Quick Fixes (Black Screen/API/DLL)"),
             ("3", "Clear Graphics Cache (Stutter Fix)"),
+            ("4", "Clear Launcher Cache (Social Club Fix)"),
+            ("5", "Cleanup All Toolbox Backups (.bak/clones)"),
             ("0", "Back")
         ]
         for opt, desc in options:
@@ -1649,9 +1753,9 @@ def handle_maintenance_menu(game_path: Optional[Path], prefix_path: Optional[Pat
         elif choice == "2":
             if game_path and prefix_path:
                 ensure_vulkan(prefix_path)
-                fix_sh_black_screen(game_path)
+                fix_sh_black_screen(game_path)  # type: ignore
                 apply_wine_overrides(prefix_path)
-                safety_checks(game_path)
+                safety_checks(game_path)  # type: ignore
                 console.print("[SUCCESS] Applied collection of quick fixes.", style="bold green")
             else: console.print("[red]Paths unknown.[/red]")
         elif choice == "3":
@@ -1659,6 +1763,59 @@ def handle_maintenance_menu(game_path: Optional[Path], prefix_path: Optional[Pat
                 count = clear_graphics_cache(prefix_path)
                 console.print(f"[bold green]Cleared {count} graphics cache files.[/bold green]")
             else: console.print("[red]Proton prefix not found.[/red]")
+        elif choice == "4":
+            if prefix_path:
+                count = clear_launcher_cache(prefix_path)
+                console.print(f"[bold green]Cleared {count} launcher cache items.[/bold green]")
+            else: console.print("[red]Proton prefix not found.[/red]")
+        elif choice == "5":
+            cleanup_all_backups(game_path, prefix_path)
+
+def create_desktop_shortcut():
+    """Generates a .desktop file for the RDR2 Steam Deck Toolbox."""
+    desktop_dir = Path.home() / "Desktop"
+    applications_dir = Path.home() / ".local/share/applications"
+    
+    # Ensure applications dir exists
+    applications_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Path to the current script
+    script_path = Path(__file__).resolve()
+    # Path to the python interpreter in the venv
+    venv_python = script_path.parent / "venv" / "bin" / "python"
+    
+    if not venv_python.exists():
+        venv_python = sys.executable # Fallback to current python
+        
+    desktop_content = f"""[Desktop Entry]
+Name=RDR2 Toolbox
+Comment=Red Dead Redemption 2 Steam Deck/Linux toolbox
+Exec=konsole -e "{venv_python}" "{script_path}"
+Icon=steam
+Terminal=false
+Type=Application
+Categories=Game;Utility;
+"""
+    
+    desktop_file_name = "RDR2_Toolbox.desktop"
+    
+    try:
+        # Create in applications menu
+        app_file = applications_dir / desktop_file_name
+        app_file.write_text(desktop_content)
+        app_file.chmod(0o755)
+        
+        # Create on desktop if it exists
+        if desktop_dir.exists():
+            desktop_file = desktop_dir / desktop_file_name
+            desktop_file.write_text(desktop_content)
+            desktop_file.chmod(0o755)
+            console.print(f"[success]Desktop shortcut created at {desktop_file}[/success]")
+        
+        console.print(f"[success]Application menu entry created at {app_file}[/success]")
+        console.print("[info]You can now find 'RDR2 Toolbox' in your application launcher or on the desktop.[/info]")
+    except Exception as e:
+        console.print(f"[red]Failed to create desktop shortcut: {e}[/red]")
 
 def handle_utilities_menu(game_path: Optional[Path], prefix_path: Optional[Path]):
     while True:
@@ -1666,6 +1823,9 @@ def handle_utilities_menu(game_path: Optional[Path], prefix_path: Optional[Path]
         options = [
             ("1", "Check Environment & Paths"),
             ("2", "Export Photo Mode Images"),
+            ("3", "Create Desktop Shortcut"),
+            ("4", "Open Game Install Folder"),
+            ("5", "Open Save Profiles Folder"),
             ("0", "Back")
         ]
         for opt, desc in options:
@@ -1680,6 +1840,12 @@ def handle_utilities_menu(game_path: Optional[Path], prefix_path: Optional[Path]
                 count = export_photo_mode_images(prefix_path, photos_dir)
                 console.print(f"[bold green]Exported {count} Photo Mode images to {photos_dir}[/bold green]")
             else: console.print("[red]Proton prefix not found.[/red]")
+        elif choice == "3":
+            create_desktop_shortcut()
+        elif choice == "4":
+            open_game_folder(game_path)
+        elif choice == "5":
+            open_save_folder(prefix_path)
 
 def display_menu():
     console.print(Panel("[bold yellow]RDR2-Deck-Master Menu[/bold yellow]", expand=False))

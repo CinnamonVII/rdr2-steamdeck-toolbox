@@ -11,15 +11,15 @@ import math
 import re
 import glob
 try:
-    import vdf
+    import vdf  # type: ignore
 except ImportError:
     vdf = None
 
 try:
-    from rich.console import Console
-    from rich.prompt import Prompt
-    from rich.table import Table
-    from rich.panel import Panel
+    from rich.console import Console  # type: ignore
+    from rich.prompt import Prompt  # type: ignore
+    from rich.table import Table  # type: ignore
+    from rich.panel import Panel  # type: ignore
 except ImportError:
     class Console:
         def print(self, msg, style=None):
@@ -70,9 +70,9 @@ def export_photo_mode_images(prefix_path: Path, output_dir: Path) -> int:
                 data = photo_file.read_bytes()
                 idx = data.find(jpeg_magic)
                 if idx != -1:
-                    target_file = output_dir / f"{photo_file.name}.jpg"
-                    target_file.write_bytes(data[idx:])
-                    exported_count += 1
+                    target_file = output_dir / f"{profile.name}_{photo_file.name}.jpg"
+                    target_file.write_bytes(data[idx:])  # type: ignore
+                    exported_count += 1  # type: ignore
             except Exception as e:
                 console.print(f"[yellow]Failed to export {photo_file.name}: {e}[/yellow]")
     
@@ -101,10 +101,50 @@ def clear_graphics_cache(prefix_path: Path) -> int:
         try:
             if target.is_file():
                 target.unlink()
-                cleared_count += 1
+                cleared_count += 1  # type: ignore
         except Exception as e:
             console.print(f"[yellow]Failed to delete {target.name}: {e}[/yellow]")
 
+    return cleared_count
+
+# ---------------------------------------------------------------------------
+# Launcher Maintenance
+# ---------------------------------------------------------------------------
+
+def clear_launcher_cache(prefix_path: Path) -> int:
+    """
+    Clears the Rockstar Games Launcher cache in the Proton prefix.
+    This can fix 'Social Club' or activation errors.
+    Returns the count of deleted files/folders.
+    """
+    launcher_data_dirs = [
+        prefix_path / "drive_c/users/steamuser/Local Settings/Application Data/Rockstar Games/Launcher",
+        prefix_path / "drive_c/users/steamuser/Local Settings/Application Data/Rockstar Games/Social Club",
+    ]
+    
+    cleared_count = 0
+    for data_dir in launcher_data_dirs:
+        if not data_dir.exists():
+            continue
+            
+        cache_dirs = [
+            data_dir / "Cache",
+            data_dir / "GPUCache",
+            data_dir / "CEF",
+        ]
+        
+        for cache in cache_dirs:
+            if cache.exists():
+                try:
+                    if cache.is_dir():
+                        shutil.rmtree(cache)
+                        cleared_count += 1
+                    elif cache.is_file():
+                        cache.unlink()
+                        cleared_count += 1
+                except Exception as e:
+                    console.print(f"[yellow]Failed to clear launcher cache at {cache.name}: {e}[/yellow]")
+                    
     return cleared_count
 
 # ---------------------------------------------------------------------------
@@ -161,8 +201,8 @@ def backup_mod_config(staging_dir: Path, output_path: Path) -> bool:
 
     discovered = sorted([d for d in mods_staging.iterdir() if d.is_dir()])
     for mod_dir in discovered:
-        if mod_dir.name not in modlist:
-            modlist[mod_dir.name] = {"enabled": True, "priority": 50}
+        if mod_dir.name not in modlist:  # type: ignore
+            modlist[mod_dir.name] = {"enabled": True, "priority": 50}  # type: ignore
 
     console.print(f"[cyan]Scanning {len(discovered)} mod(s) – computing CRC32 hashes...[/cyan]")
 
@@ -178,13 +218,13 @@ def backup_mod_config(staging_dir: Path, output_path: Path) -> bool:
             rel_files.append(rel)
             try:
                 file_hashes[rel] = _crc32_file(f)
-                total_bytes     += f.stat().st_size
+                total_bytes     += f.stat().st_size  # type: ignore
             except OSError:
                 file_hashes[rel] = "ioerror"
         mod_registry[mod_dir.name] = {
             "structure_type": _detect_mod_structure(mod_dir),
             "file_count":     len(rel_files),
-            "total_size_kb":  round(total_bytes / 1024, 1),
+            "total_size_kb":  round(total_bytes / 1024, 1),  # type: ignore
             "files":          rel_files,
             "file_hashes":    file_hashes,
         }
@@ -202,7 +242,7 @@ def backup_mod_config(staging_dir: Path, output_path: Path) -> bool:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2, ensure_ascii=False)
-        size_kb = round(output_path.stat().st_size / 1024, 1)
+        size_kb = round(output_path.stat().st_size / 1024, 1)  # type: ignore
         console.print(
             f"\n[bold green]Backup saved:[/bold green] it's located at [cyan]{output_path}[/cyan] "
             f"({size_kb} KB — {len(mod_registry)} mod(s) catalogued)"
@@ -281,7 +321,7 @@ def restore_mod_config(backup_path: Path, staging_dir: Path) -> Tuple[bool, List
 
         if not mod_dir.exists():
             missing_mods.append(mod_name)
-            table.add_row(mod_name, structure_type, str(file_count),
+            table.add_row(mod_name, structure_type, str(file_count),  # type: ignore
                           "[red]MISSING[/red]", "[dim]n/a[/dim]")
             continue
 
@@ -301,9 +341,9 @@ def restore_mod_config(backup_path: Path, staging_dir: Path) -> Tuple[bool, List
         if mismatches:
             hash_warnings.append(mod_name)
 
-        current_modlist[mod_name] = backup_modlist.get(mod_name, {"enabled": True, "priority": 50})
+        current_modlist[mod_name] = backup_modlist.get(mod_name, {"enabled": True, "priority": 50})  # type: ignore
         restored_mods.append(mod_name)
-        table.add_row(mod_name, structure_type, str(file_count), "[green]RESTORED[/green]", integrity_str)
+        table.add_row(mod_name, structure_type, str(file_count), "[green]RESTORED[/green]", integrity_str)  # type: ignore
 
     console.print(table)
 
@@ -355,7 +395,7 @@ def list_backups(backup_dir: Path) -> List[Dict]:
                 "path": f, "name": f.name, "created_at": created_at,
                 "mod_count": data.get("mod_count", 0),
                 "schema_version": data.get("schema_version", "?"),
-                "size_kb": round(f.stat().st_size / 1024, 1),
+                "size_kb": round(f.stat().st_size / 1024, 1),  # type: ignore
             })
         except (json.JSONDecodeError, OSError):
             try:
@@ -363,7 +403,7 @@ def list_backups(backup_dir: Path) -> List[Dict]:
                     "path": f, "name": f.name,
                     "created_at": datetime.datetime.fromtimestamp(f.stat().st_mtime),
                     "mod_count": -1, "schema_version": "corrupt",
-                    "size_kb": round(f.stat().st_size / 1024, 1),
+                    "size_kb": round(f.stat().st_size / 1024, 1),  # type: ignore
                 })
             except OSError:
                 pass
@@ -375,7 +415,7 @@ def list_backups(backup_dir: Path) -> List[Dict]:
 # Steam / installation discovery
 # =============================================================================
 
-def get_steam_root() -> Path:
+def get_steam_root() -> Optional[Path]:
     candidates = [
         Path.home() / ".local/share/Steam",
         Path.home() / ".steam/steam",
