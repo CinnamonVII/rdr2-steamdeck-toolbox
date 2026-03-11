@@ -217,8 +217,9 @@ def backup_mod_config(staging_dir: Path, output_path: Path) -> bool:
             rel = str(f.relative_to(mod_dir))
             rel_files.append(rel)
             try:
+                size = f.stat().st_size  # type: ignore
                 file_hashes[rel] = _crc32_file(f)
-                total_bytes     += f.stat().st_size  # type: ignore
+                total_bytes     += size
             except OSError:
                 file_hashes[rel] = "ioerror"
         mod_registry[mod_dir.name] = {
@@ -337,6 +338,12 @@ def restore_mod_config(backup_path: Path, staging_dir: Path) -> Tuple[bool, List
             except OSError:
                 mismatches += 1
 
+        if mismatches == len(backup_hashes) and len(backup_hashes) > 0:
+            missing_mods.append(mod_name)
+            table.add_row(mod_name, structure_type, str(file_count),  # type: ignore
+                          "[red]MISSING (empty dir)[/red]", "[red]0/N[/red]")
+            continue
+
         integrity_str = "[green]OK[/green]" if mismatches == 0 else f"[yellow]{mismatches} changed[/yellow]"
         if mismatches:
             hash_warnings.append(mod_name)
@@ -422,6 +429,9 @@ def get_steam_root() -> Optional[Path]:
         Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
     ]
     for path in candidates:
+        if (path / "steamapps/compatdata/1174180").exists():
+            return path
+    for path in candidates:
         if path.exists():
             return path
     return None
@@ -434,11 +444,15 @@ def find_rdr2_installation() -> Tuple[Optional[Path], Optional[Path]]:
         Path.home() / ".var/app/com.valvesoftware.Steam/.local/share/Steam",
     ]
     
-    sd_mounts = glob.glob("/run/media/mmcblk0p*/SteamLibrary")
-    for p in sd_mounts:
-        candidate = Path(p)
-        if candidate not in steam_roots:
-            steam_roots.append(candidate)
+    sd_patterns = [
+        "/run/media/mmcblk0p*/SteamLibrary",
+        "/run/media/deck/*/SteamLibrary",
+    ]
+    for pattern in sd_patterns:
+        for p in glob.glob(pattern):
+            candidate = Path(p)
+            if candidate not in all_library_folders:
+                all_library_folders.append(candidate)
     
     default_root = get_steam_root()
     if default_root is not None and default_root not in steam_roots:

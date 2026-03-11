@@ -17,5 +17,3 @@ simulation_box/
 token.txt
 release.sh
 delete_tag.sh
-save_modifier.py
-.env

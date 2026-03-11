@@ -270,12 +270,14 @@ def apply_wine_overrides(prefix_path: Optional[Path]):
 
         final_lines = []
         i = 0
+        section_injected = False
         while i < len(new_lines):
             line = new_lines[i]
             final_lines.append(line)
-            if line.strip() == section_header:
+            if line.strip() == section_header and not section_injected:
                 for dll, val in overrides.items():
                     final_lines.append(f'"{dll}"="{val}"\n')
+                section_injected = True
                 i += 1
                 while i < len(new_lines) and not new_lines[i].strip().startswith("["):  # type: ignore
                     stripped_inner = new_lines[i].strip()  # type: ignore
@@ -379,7 +381,7 @@ def update_lml_mods_xml(game_path: Path, mod_name: str, enabled: bool = True):
     try:
         if hasattr(ET, "indent"):
             ET.indent(root, space="    ")
-        tree.write(mods_xml, encoding='utf-8', xml_declaration=False)  # type: ignore
+        tree.write(mods_xml, encoding='utf-8', xml_declaration=True)  # type: ignore
     except Exception as e:
         console.print(f"[red]Failed to update mods.xml: {e}[/red]")
 
@@ -480,32 +482,20 @@ def install_lml(game_path: Path):
             console.print("[yellow]Then extract 'vfs.asi' and everything inside 'ModLoader' to your RDR2 folder.[/yellow]")
 
 def install_lml_from_path(extract_path: Path, game_path: Path):
-    modloader_root = None
+    # Pass 1: find and copy vfs.asi
+    for f in extract_path.rglob("*"):
+        if f.is_file() and f.name.lower() == "vfs.asi":
+            shutil.copy2(f, game_path / "vfs.asi")
+            if (f.parent / "lml").is_dir():
+                shutil.copytree(f.parent / "lml", game_path / "lml", dirs_exist_ok=True)
+            break
+
+    # Pass 2: find and copy ModLoader contents
     for root, _, files in os.walk(extract_path):
         root_path = Path(root)
-        if modloader_root is None and root_path.name == "ModLoader":
-            modloader_root = root_path
-        if modloader_root is not None:
-            is_relative = False
-            try:
-                 root_path.relative_to(modloader_root)  # type: ignore
-                 is_relative = True
-            except ValueError:
-                 pass
-            
-            if is_relative:
-                for file in files:
-                    file_path = root_path / file
-                    rel = file_path.relative_to(modloader_root)  # type: ignore
-                    target = game_path / rel
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(file_path, target)
-        elif "vfs.asi" in [f.lower() for f in files]:
-             for f in files:
-                 if f.lower() == "vfs.asi":
-                     shutil.copy2(root_path / f, game_path / "vfs.asi")
-             if (root_path / "lml").is_dir():
-                 shutil.copytree(root_path / "lml", game_path / "lml", dirs_exist_ok=True)
+        if root_path.name == "ModLoader":
+            shutil.copytree(root_path, game_path, dirs_exist_ok=True)
+            break
 
 def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     mods_staging = STAGING_DIR / "mods"
@@ -534,21 +524,8 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     with open(modlist_file, "w") as f:
         json.dump(modlist, f, indent=4)
 
-    def check_install_xml(mod_dir: Path) -> bool:
-        try:
-            return any(f.name.lower() == "install.xml" for f in mod_dir.rglob("*"))
-        except (PermissionError, OSError):
-            return False
-
-    requires_lml = any(
-        check_install_xml(mods_staging / name)
-        for name, data in modlist.items() if isinstance(data, dict) and data.get("enabled", True) and (mods_staging / name).is_dir()
-    )
-
-    if requires_lml:
-        install_lml(game_path)
-
     deployment_queue: Dict[str, Dict[str, Any]] = {}
+    lml_installed = False
     requires_scripthook = False
     for mod_name, data in sorted(modlist.items(), key=lambda x: x[1].get('priority', 50) if isinstance(x[1], dict) else 50):  # type: ignore
         if not isinstance(data, dict) or not data.get("enabled", True):
@@ -561,6 +538,10 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
 
         mod_files = list(mod_dir.rglob("*"))
         is_lml_package = any(f.name.lower() == "install.xml" for f in mod_files)
+        if is_lml_package and not lml_installed:
+            install_lml(game_path)
+            lml_installed = True
+
         if is_lml_package:
             update_lml_mods_xml(game_path, mod_name)
 
@@ -644,18 +625,12 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
             linked_count += 1
         except OSError as e:
             if e.errno == errno.EXDEV:
-                console.print(f"[yellow]Crossing partitions. Using reflink for {target_path.name}[/yellow]")
-                result = subprocess.run(["cp", "--reflink=auto", str(source_path), str(target_path)], capture_output=True)
-                if result.returncode != 0:
-                     try:
-                         shutil.copy2(source_path, target_path)
-                         new_manifest_entries[str(target_path)] = {"source": info["source"], "type": "copy"}
-                         linked_count += 1
-                     except OSError as copy_err:
-                         console.print(f"[red]Fallback copy also failed for {target_path.name}: {copy_err}[/red]")
-                else:
+                try:
+                    shutil.copy2(source_path, target_path)
                     new_manifest_entries[str(target_path)] = {"source": info["source"], "type": "copy"}
                     linked_count += 1
+                except OSError as copy_err:
+                    console.print(f"[red]Fallback copy failed for {target_path.name}: {copy_err}[/red]")
             else:
                 console.print(f"[red]Failed to link {target_path.name}: {e}[/red]")
 
@@ -677,7 +652,8 @@ def clean_purge():
         is_managed = False
         if target_path.exists() and target_path.is_file():
             if isinstance(source_info, dict) and source_info.get("type") == "copy":
-                is_managed = True
+                if source_path.exists() and target_path.stat().st_size == source_path.stat().st_size:
+                    is_managed = True
             elif source_path.exists():
                 try:
                     if target_path.stat().st_ino == source_path.stat().st_ino:
@@ -994,8 +970,11 @@ def handle_steam_deck_optimizations(game_path: Optional[Path], prefix_path: Opti
         elif choice == "5":
             set_windows_version(prefix_path)
         elif choice == "6":
-            if Prompt.ask("Purge all shader caches? This removes sga_* files and pipelinestate.cache. (y/N)", default="n").lower() == "y":
-                clear_graphics_cache(prefix_path)
+            if prefix_path and Prompt.ask("Purge all shader caches? This removes sga_* files and pipelinestate.cache. (y/N)", default="n").lower() == "y":
+                count = clear_graphics_cache(prefix_path)
+                console.print(f"[bold green]Cleared {count} cache files.[/bold green]")
+            elif not prefix_path:
+                console.print("[red]Proton prefix not found.[/red]")
         elif choice == "7":
             ensure_vulkan(prefix_path)
             apply_wine_overrides(prefix_path)
@@ -1150,7 +1129,11 @@ class NexusManager:
                 downloads = "N/A"
                 for stat in stat_elems:
                     if "Downloads" in stat.text:
-                        downloads = stat.text.split("Downloads")[-1].strip()
+                        match = re.search(r'[\d,]+', stat.text)
+                        if match:
+                            downloads = match.group(0)
+                        else:
+                            downloads = stat.text.split("Downloads")[-1].strip()
                 
                 results.append({
                     "name": name_elem.text.strip(),
@@ -1634,7 +1617,7 @@ def handle_recommended_mods(game_path: Optional[Path], prefix_path: Optional[Pat
                     if Prompt.ask("Try automatic install for Skip Intro? (y/N)", default="n").lower() == "y":
                         if game_path: install_skip_intro(game_path, prefix_path)  # type: ignore
                         else: console.print("[red]Game path unknown.[/red]")
-            elif selected["action"] == "cache":
+            elif selected.get("action") == "cache":
                 if prefix_path:
                     count = clear_graphics_cache(prefix_path)
                     console.print(f"[SUCCESS] Cleared {count} cache files.")
@@ -1699,10 +1682,8 @@ def handle_mods_menu(game_path: Optional[Path], prefix_path: Optional[Path]):
         elif choice == "8":
             handle_backup_manager(game_path, prefix_path)
         elif choice == "9":
-            if game_path:
-                if Prompt.ask("PURGE all deployed mods? (y/N)", default="n").lower() == "y":
-                    clean_purge()
-            else: console.print("[red]Game path unknown.[/red]")
+            if Prompt.ask("PURGE all deployed mods? (y/N)", default="n").lower() == "y":
+                clean_purge()
 
 def handle_saves_menu(prefix_path: Optional[Path]):
     while True:
@@ -1787,10 +1768,18 @@ def create_desktop_shortcut():
     if not venv_python.exists():
         venv_python = sys.executable # Fallback to current python
         
+    terminal = next(
+        (t for t in ["konsole", "gnome-terminal", "xterm", "foot"] if shutil.which(t)),
+        None
+    )
+    if not terminal:
+        console.print("[red]No terminal emulator found. Cannot create desktop shortcut.[/red]")
+        return
+        
     desktop_content = f"""[Desktop Entry]
 Name=RDR2 Toolbox
 Comment=Red Dead Redemption 2 Steam Deck/Linux toolbox
-Exec=konsole -e "{venv_python}" "{script_path}"
+Exec={terminal} -e "{venv_python}" "{script_path}"
 Icon=steam
 Terminal=false
 Type=Application
