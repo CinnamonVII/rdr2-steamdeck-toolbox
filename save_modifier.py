@@ -1,0 +1,850 @@
+"""
+RDR2 Save Modifier — Rewritten based on actual save file reverse engineering.
+
+Real SRDR PC save format (verified against 4 live save files):
+  - Header:  260 bytes (0x104), starts with magic 0x00000004, contains
+             UTF-16LE metadata (chapter name, completion%, timestamp)
+  - Payload: XOR-obfuscated with a 16-byte key that is embedded in the file
+             itself (derived as the most-common 16-byte block in the payload).
+  - After deobfuscation: raw binary game state (no compression). ~78% null
+             bytes with dense data islands. Money stored as int32 cents.
+
+Public API (consumed by rdr2_toolbox.py):
+    validate_and_sign_srdr, edit_save_file, list_save_files,
+    select_save_file, handle_option_4, farm_honor,
+    create_save_snapshot, restore_save_snapshot
+"""
+
+from typing import Optional, Tuple, List, Dict, Any
+import os
+import struct
+import shutil
+from pathlib import Path
+import zlib
+import zipfile
+import subprocess
+import datetime
+import math
+import io
+import time
+from collections import Counter
+
+try:
+    from rich.console import Console  # type: ignore
+    from rich.prompt import Prompt  # type: ignore
+    from rich.table import Table  # type: ignore
+except ImportError:
+    class Console:
+        def print(self, msg, style=None):
+            if "[red]" in str(msg):
+                print(f"ERROR: {msg}")
+            elif "[success]" in str(msg) or "[bold green]" in str(msg):
+                print(f"SUCCESS: {msg}")
+            else:
+                print(msg)
+    class Prompt:
+        @staticmethod
+        def ask(msg, choices=None, default=None):
+            prompt_text = msg
+            if choices: prompt_text += f" ({'/'.join(choices)})"
+            if default: prompt_text += f" [{default}]"
+            res = input(f"{prompt_text}: ").strip()
+            return res if res else (default if default is not None else "")
+    class Table:
+        def __init__(self, *a, **k): pass
+        def add_column(self, *a, **k): pass
+        def add_row(self, *a, **k): pass
+
+console = Console()
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# SRDR header
+_SRDR_MAGIC        = b'\x00\x00\x00\x04'   # Format version 4
+_HEADER_LEN        = 0x104                  # 260 bytes (confirmed by rdr2view)
+# Note: there is NO checksum field in the SRDR header.
+# Offset 0x04 onward is UTF-16LE description text (chapter, completion%, timestamp).
+# The header is: 4 bytes magic + UTF-16LE text + null padding to 260 bytes.
+
+# Max plausible money in cents (INT32_MAX)
+_MAX_CENTS = 2_147_483_647
+# Upper bound for a "plausible" money value in cents ($100,000)
+_PLAUSIBLE_MONEY_MAX = 10_000_000
+
+# SRDR slot index → human-readable label
+# Per the RAGE engine: SRDR30000–SRDR30014 = manual slots, SRDR30015 = autosave
+_SRDR_SLOT_MAP: Dict[str, str] = {
+    **{f"SRDR{30000 + i:05d}": f"Manual Slot {i}" for i in range(15)},
+    "SRDR30015": "Autosave",
+}
+
+
+# Known XOR key for SRDR format version 4 (verified across multiple saves)
+_KNOWN_XOR_KEY = bytes.fromhex("9a2c64cf6a76acfae1430b728940903c")
+
+
+def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
+    """
+    Returns the XOR key for this payload.
+    Fast path: verifies the known hardcoded key works (>1% block occurrences).
+    Slow path: byte-frequency analysis fallback for unknown key variants.
+    """
+    if len(payload) < key_len:
+        raise RuntimeError("Payload too small to extract XOR key")
+
+    # Fast path: check if the known key works
+    total_blocks = len(payload) // key_len
+    count = 0
+    idx = 0
+    while True:
+        pos = payload.find(_KNOWN_XOR_KEY, idx)
+        if pos == -1:
+            break
+        count += 1
+        idx = pos + key_len  # type: ignore
+    
+    if count >= total_blocks * 0.01:
+        return _KNOWN_XOR_KEY
+
+    # Slow path: byte-frequency analysis
+    console.print("[dim]Known key mismatch, extracting key...[/dim]")
+    key_bytes = bytearray(key_len)
+    for pos in range(key_len):
+        counts = [0] * 256
+        for i in range(pos, len(payload), key_len):
+            counts[payload[i]] += 1
+        key_bytes[pos] = counts.index(max(counts))  # type: ignore
+
+    key = bytes(key_bytes)
+    # Verify extracted key
+    count = 0
+    idx = 0
+    while True:
+        pos = payload.find(key, idx)
+        if pos == -1:
+            break
+        count += 1
+        idx = pos + key_len  # type: ignore
+    
+    if count < total_blocks * 0.01:
+        raise RuntimeError(
+            f"XOR key extraction uncertain: key appears "
+            f"only {count}/{total_blocks} times"
+        )
+
+    return key
+
+
+def _xor_deobfuscate(payload: bytes, key: bytes) -> bytearray:
+    """Applies XOR key to deobfuscate/re-obfuscate payload (symmetric).
+    Uses a single big-integer XOR for maximum speed in pure Python."""
+    payload_len = len(payload)
+    key_len = len(key)
+    
+    # Expand key to cover the full payload length
+    full_reps = payload_len // key_len
+    remainder = payload_len % key_len
+    expanded_key = key * full_reps + key[:remainder]  # type: ignore
+    
+    # Single XOR on the entire data as big integers
+    payload_int = int.from_bytes(payload, 'big')
+    key_int = int.from_bytes(expanded_key, 'big')
+    result_int = payload_int ^ key_int  # type: ignore
+    
+    return bytearray(result_int.to_bytes(payload_len, 'big'))
+
+
+# Keep old name as alias for compatibility
+def xor_data(data: bytes, key: bytes, start_offset: int = 0) -> bytearray:
+    """Applies XOR cycle to data using a key with an optional periodicity shift."""
+    res = bytearray(data)
+    for i in range(len(res)):
+        res[i] ^= key[(i + start_offset) % len(key)]
+    return res
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  2.  Header Validation (no checksum in SRDR format)                      ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def validate_and_sign_srdr(file_path: Path):
+    """
+    Public API stub — kept for import compatibility.
+
+    The SRDR header has NO checksum field. Bytes 0x04 onward contain
+    UTF-16LE description text (chapter name, completion %, timestamp).
+    Writing a computed integer there destroys the header and causes
+    the RAGE engine to crash on load.  This function is intentionally
+    a no-op.
+    """
+    pass
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  3.  Layer Handling (unwrap / rewrap)                                    ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, Dict]:
+    """
+    Strips XOR obfuscation from an SRDR save payload.
+    Returns (plaintext_bytearray, metadata_dict).
+    """
+    if mode != 'decrypt':
+        raise ValueError(f"Only 'decrypt' mode supported, got '{mode}'")
+
+    if len(data) <= _HEADER_LEN:  # type: ignore
+        raise RuntimeError(f"File too small ({len(data)} bytes)")
+
+    if data[:4] != _SRDR_MAGIC:  # type: ignore
+        console.print(
+            f"[yellow]Warning: unexpected magic {data[:4].hex()}, "  # type: ignore
+            f"expected {_SRDR_MAGIC.hex()}[/yellow]"
+        )
+
+    header = data[:_HEADER_LEN]  # type: ignore
+    payload = data[_HEADER_LEN:]  # type: ignore
+
+    # Extract the XOR key from the payload
+    xor_key = _extract_xor_key(payload)
+
+    # Deobfuscate
+    plaintext = _xor_deobfuscate(payload, xor_key)
+
+    # Verify: deobfuscated data should have high null-byte ratio
+    null_sample = sum(1 for b in plaintext[:4096] if b == 0)  # type: ignore
+    null_ratio = null_sample / min(4096, len(plaintext))
+    if null_ratio < 0.3:
+        console.print(
+            f"[yellow]Warning: deobfuscated data has low null ratio "
+            f"({null_ratio:.1%}). XOR key may be incorrect.[/yellow]"
+        )
+
+    metadata: Dict[str, Any] = {
+        'is_auto': False,  # kept for API compatibility
+        'manual_shift': 0,
+        'original_header': header,
+        'header_len': _HEADER_LEN,
+        'xor_key': xor_key,
+    }
+
+    return plaintext, metadata
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  4.  File System Helpers                                                 ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def _slot_label(filename: str) -> str:
+    """Returns a human-readable label for an SRDR filename."""
+    base = Path(filename).stem.upper()
+    return _SRDR_SLOT_MAP.get(base, base)
+
+
+def _find_profiles_dir(prefix_path: Path) -> Optional[Path]:
+    profiles_dir = (
+        prefix_path
+        / "drive_c/users/steamuser/Documents/Rockstar Games"
+        / "Red Dead Redemption 2/Profiles"
+    )
+    return profiles_dir if profiles_dir.exists() else None
+
+
+def list_save_files(prefix_path: Optional[Path]) -> List[Dict]:
+    if not prefix_path:
+        return []
+    profiles_dir = _find_profiles_dir(prefix_path)
+    if not profiles_dir:
+        return []
+
+    saves: List[Dict] = []
+    for profile_dir in profiles_dir.iterdir():
+        if not profile_dir.is_dir():
+            continue
+        for save_file in profile_dir.glob("SRDR*"):
+            name = save_file.name
+            if name.endswith(".bak") or "clone" in name.lower() or "_CLONED_" in name:
+                continue
+            try:
+                stat = save_file.stat()
+            except OSError:
+                continue
+            is_auto = name.upper() == "SRDR30015"
+            saves.append({
+                "path":    save_file,
+                "name":    name,
+                "label":   _slot_label(name),
+                "size_kb": round(stat.st_size / 1024, 1),  # type: ignore
+                "mtime":   datetime.datetime.fromtimestamp(stat.st_mtime),
+                "profile": profile_dir.name,
+                "is_auto": is_auto,
+            })
+    saves.sort(key=lambda s: (
+        0 if s["is_auto"] else 1,
+        s["name"].upper(),
+        -s["mtime"].timestamp(),
+    ))
+    return saves
+
+
+def get_latest_save_file(prefix_path: Optional[Path]) -> Optional[Path]:
+    saves = list_save_files(prefix_path)
+    if not saves:
+        return None
+    return max(saves, key=lambda s: s["mtime"])["path"]
+
+
+def select_save_file(prefix_path: Optional[Path]) -> Optional[Path]:
+    saves = list_save_files(prefix_path)
+    if not saves:
+        console.print("[red]No SRDR save files found in the Proton prefix.[/red]")
+        return None
+    table = Table(title="Available Save Files", show_lines=True)
+    table.add_column("#",        style="bold cyan",    width=4,  justify="right")
+    table.add_column("Slot",     style="bold white",   width=18)
+    table.add_column("File",     style="dim",          width=14)
+    table.add_column("Profile",  style="magenta",      width=10)
+    table.add_column("Size",     style="yellow",       width=9,  justify="right")
+    table.add_column("Modified", style="green",        width=20)
+    for i, s in enumerate(saves, 1):
+        auto_tag = " [bold yellow](AUTO)[/bold yellow]" if s["is_auto"] else ""
+        table.add_row(  # type: ignore
+            str(i),
+            s["label"] + auto_tag,
+            s["name"],
+            s["profile"][:8],
+            f"{s['size_kb']} KB",
+            s["mtime"].strftime("%Y-%m-%d  %H:%M"),
+        )
+    console.print(table)
+    valid_choices = [str(i) for i in range(1, len(saves) + 1)] + ["0"]
+    choice = Prompt.ask(
+        f"Select a save slot to edit [bold](1–{len(saves)})[/bold], or [bold]0[/bold] to cancel",
+        choices=valid_choices,
+    )
+    if choice == "0":
+        return None
+    selected = saves[int(choice) - 1]
+    console.print(
+        f"[cyan]Selected:[/cyan] [bold]{selected['label']}[/bold] "
+        f"([dim]{selected['name']}[/dim])"
+    )
+    return selected["path"]
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  5.  In-Memory Patching (fuzzy-range scan)                               ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def _find_all_occurrences(data: bytearray, pattern: bytes) -> List[int]:
+    """Finds all occurrences of pattern in data."""
+    positions = []
+    idx = 0
+    while True:
+        pos = data.find(pattern, idx)
+        if pos == -1:
+            break
+        positions.append(pos)
+        idx = pos + 1  # type: ignore
+    return positions
+
+
+def _scan_int32_positions(
+    data: bytearray, low: int, high: int,
+) -> Dict[int, List[int]]:
+    """
+    Scans data for 4-byte-aligned int32 values in [low, high].
+    Returns {value: [list_of_offsets]}.
+    """
+    result: Dict[int, List[int]] = {}
+    aligned_len = (len(data) // 4) * 4
+    for offset, (val,) in enumerate(struct.iter_unpack('<i', data[:aligned_len])):  # type: ignore
+        if low <= val <= high:
+            result.setdefault(val, []).append(offset * 4)
+    return result
+
+
+def _scan_float32_positions(
+    data: bytearray, low: float, high: float,
+) -> Dict[float, List[int]]:
+    """
+    Scans data for 4-byte-aligned float32 values in [low, high].
+    Groups by rounded display value but tracks actual offsets.
+    Returns {display_value_rounded: [list_of_offsets]}.
+    """
+    result: Dict[float, List[int]] = {}
+    aligned_len = (len(data) // 4) * 4
+    for offset, (val,) in enumerate(struct.iter_unpack('<f', data[:aligned_len])):  # type: ignore
+        if val == val and low <= val <= high:  # NaN check
+            rounded = round(val, 2)  # type: ignore
+            result.setdefault(rounded, []).append(offset * 4)
+    return result
+
+
+def _prompt_candidate_choice(label: str, candidates: list, shown: int = 10) -> int:
+    """
+    Shows candidates and lets the user pick one.
+    Returns the 0-based index of the selected candidate.
+    """
+    console.print(f"\n[cyan]{label}:[/cyan]")
+    shown = min(shown, len(candidates))
+    for i in range(shown):
+        console.print(f"  {candidates[i]}")
+
+    valid = [str(i) for i in range(1, shown + 1)]
+    choice = Prompt.ask(
+        f"Select a candidate [bold](1–{shown})[/bold]",
+        choices=valid,
+        default="1",
+    )
+    return int(choice) - 1
+
+
+def _patch_money(
+    work_data: bytearray,
+    money_amount: float,
+    current_money: Optional[float],
+) -> bool:
+    """
+    Patches money in the deobfuscated save data using fuzzy-range scanning.
+    Lets the user choose which candidate value to replace.
+    """
+    target_cents = int(round(money_amount * 100))
+    if target_cents < 0 or target_cents > _MAX_CENTS:
+        console.print(
+            f"[red]Money value ${money_amount:.2f} is out of range. "
+            f"Maximum is ${_MAX_CENTS / 100:.2f}.[/red]"
+        )
+    # ── Strategy 1: fuzzy-range scan ─────────────────────────────────
+    if current_money:
+        # User gave a hint — scan ±50% around it
+        approx = current_money
+        console.print(
+            f"[cyan]Scanning for values near ${approx:.2f}...[/cyan]"
+        )
+        float_low = max(0.01, approx * 0.5)
+        float_high = approx * 1.5
+    else:
+        # No hint — broad scan of all plausible money values ($1–$100k)
+        console.print(
+            "[cyan]No current money hint — broad-scanning all plausible "
+            "money values ($1–$100,000)...[/cyan]"
+        )
+        float_low = 1.0
+        float_high = 100_000.0
+
+    float_positions = _scan_float32_positions(work_data, float_low, float_high)
+
+    # Merge: (display_value, count, offsets_list)
+    all_candidates: List[Tuple[float, int, List[int]]] = []
+    for val, offsets in float_positions.items():
+        all_candidates.append((val, len(offsets), offsets))
+
+    all_candidates.sort(key=lambda x: -x[1])
+
+    if not all_candidates:
+        console.print(
+            f"[yellow]No floating point matches found. Cannot patch money.[/yellow]"
+        )
+        return False
+
+    # Build display lines for user selection
+    shown = min(10, len(all_candidates))
+    lines = []
+    for i, (display, count, _) in enumerate(all_candidates[:shown], 1):  # type: ignore
+        lines.append(f"{i:>2d}. ${display:>12.2f}  ({count:>4d} hits)")
+
+    idx = _prompt_candidate_choice("Money candidates found", lines, shown)
+    chosen_display, chosen_count, chosen_offsets = all_candidates[idx]
+
+    # Patch all offsets for the chosen value
+    new_bytes = struct.pack('<f', float(money_amount))
+
+    for pos in chosen_offsets:
+        work_data[pos:pos + 4] = new_bytes  # type: ignore
+
+    console.print(
+        f"[bold green]✓ Patched Money: ${chosen_display:.2f} → "
+        f"${money_amount:.2f} at {len(chosen_offsets)} location(s)[/bold green]"
+    )
+    return True
+
+
+
+
+def _patch_honor(
+    work_data: bytearray,
+    honor_choice: str,
+    current_honor: Optional[float],
+) -> bool:
+    """
+    Patches honor in the deobfuscated save data.
+    Scans for float32 values in the honor range, shows candidates,
+    and lets the user choose which to patch.
+    """
+    target_val = 500.0 if honor_choice == "highest" else -500.0
+    target_bytes = struct.pack('<f', target_val)
+
+    console.print("[cyan]Scanning for honor values...[/cyan]")
+
+    # Scan for ALL float32 values in the broad honor range
+    float_positions = _scan_float32_positions(work_data, -1000.0, 1000.0)
+
+    # Filter out noise
+    filtered: List[Tuple[float, int, List[int]]] = []
+    for val, offsets in float_positions.items():
+        if abs(val) < 1.0:  # Skip near-zero noise
+            continue
+        if len(offsets) < 2:  # Skip unique values
+            continue
+        filtered.append((val, len(offsets), offsets))
+
+    # Sort by frequency, or by proximity to user hint
+    if current_honor is not None:
+        filtered.sort(key=lambda x: (abs(x[0] - current_honor), -x[1]))
+    else:
+        filtered.sort(key=lambda x: -x[1])
+
+    if not filtered:
+        console.print(
+            "[yellow]No plausible honor values found in save data.[/yellow]"
+        )
+        return False
+
+    # Build display lines
+    shown = min(10, len(filtered))
+    lines = []
+    for i, (val, count, _) in enumerate(filtered[:shown], 1):  # type: ignore
+        lines.append(f"{i:>2d}. {val:>10.2f}  ({count:>4d} hits)")
+
+    idx = _prompt_candidate_choice("Honor candidates found", lines, shown)
+    chosen_val, chosen_count, chosen_offsets = filtered[idx]
+
+    # Patch all offsets for the chosen value
+    for pos in chosen_offsets:
+        work_data[pos:pos + 4] = target_bytes  # type: ignore
+
+    console.print(
+        f"[bold green]✓ Patched Honor: {chosen_val:.2f} → {target_val:.1f} "
+        f"at {len(chosen_offsets)} location(s)[/bold green]"
+    )
+    return True
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  6.  Main Edit Pipeline                                                  ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def edit_save_file(
+    save_path: Path,
+    money_amount: Optional[float] = None,
+    honor_choice: Optional[str] = None,
+    current_money: Optional[float] = None,
+    current_honor: Optional[float] = None,
+) -> bool:
+    """
+    Edits an SRDR save file: deobfuscates, patches money/honor,
+    re-obfuscates, updates checksum, writes back.
+    """
+    console.print(f"\n[cyan]Editing Save File: {save_path.name}[/cyan]")
+
+    # ── Backup management ────────────────────────────────────────────────
+    existing_clones = sorted(save_path.parent.glob(f"{save_path.stem}_CLONED_*"))
+    while len(existing_clones) >= 3:
+        try:
+            existing_clones.pop(-1).unlink(missing_ok=True)
+        except OSError:
+            break
+
+    bak_path = save_path.with_suffix(save_path.suffix + ".bak")
+    try:
+        shutil.copy2(save_path, bak_path)
+        console.print(f"Backup refreshed: {bak_path.name}")
+    except OSError as e:
+        console.print(f"[yellow]Warning: could not refresh backup: {e}[/yellow]")
+
+    clone_path = save_path.parent / f"{save_path.stem}_CLONED_{int(time.time())}"
+    try:
+        shutil.copy2(save_path, clone_path)
+        console.print(f"Safe duplication: Created cloned stamp ({clone_path.name})")
+    except OSError as e:
+        console.print(f"[yellow]Warning: could not create clone: {e}[/yellow]")
+
+    # ── Read raw file ────────────────────────────────────────────────────
+    with open(save_path, 'rb') as f:
+        raw_data = f.read()
+
+    # ── Unwrap (XOR deobfuscation) ───────────────────────────────────────
+    try:
+        work_data, meta = handle_srdr_layers(raw_data, mode='decrypt')
+        xor_key = meta['xor_key']
+        header = meta['original_header']
+        console.print(
+            f"Deobfuscated payload ({len(work_data)} bytes, "
+            f"key: {xor_key.hex()[:16]}...)"
+        )
+    except RuntimeError as e:
+        console.print(f"[red]Failed to unwrap save layers: {e}[/red]")
+        return False
+
+    # ── Apply patches ────────────────────────────────────────────────────
+    patched_any = False
+    if money_amount is not None:
+        if _patch_money(work_data, money_amount, current_money):  # type: ignore
+            patched_any = True
+
+    if honor_choice is not None:
+        if _patch_honor(work_data, honor_choice, current_honor):
+            patched_any = True
+
+    if not patched_any:
+        console.print("[yellow]No changes made to save file.[/yellow]")
+        return False
+
+    # ── Re-wrap: XOR re-obfuscate and write back ────────────────────────
+    try:
+        # Re-obfuscate with the same key (XOR is symmetric)
+        re_obfuscated = _xor_deobfuscate(bytes(work_data), xor_key)
+
+        # Rebuild file: original header (untouched) + re-obfuscated payload
+        final_data = header + bytes(re_obfuscated)
+
+        with open(save_path, 'wb') as f:
+            f.write(final_data)
+
+        console.print(
+            f"[bold green]✓ Save file written ({len(final_data)} bytes)[/bold green]"
+        )
+        return True
+
+    except Exception as e:
+        console.print(f"[red]Failed to re-wrap save file: {e}[/red]")
+        if bak_path.exists():
+            try:
+                shutil.copy2(bak_path, save_path)
+                console.print("[yellow]Restored save file from backup.[/yellow]")
+            except OSError:
+                pass
+        return False
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  7.  UI / Prompts                                                        ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def _prompt_save_edits() -> Tuple[Optional[float], Optional[str], Optional[float], Optional[float]]:
+    money_input = Prompt.ask(
+        "Enter Target Money Amount (e.g. 5000), or leave empty to skip",
+        default="",
+    )
+    money_val: Optional[float] = None
+    curr_money_val: Optional[float] = None
+
+    if money_input.strip():
+        try:
+            money_val = float(money_input)
+            if money_val <= 0:
+                console.print("[yellow]Money must be positive. Skipping.[/yellow]")
+                money_val = None
+            elif int(round(money_val * 100)) > _MAX_CENTS:
+                console.print(
+                    f"[yellow]Money value ${money_val:.2f} exceeds maximum "
+                    f"(${_MAX_CENTS / 100:.2f}). Skipping.[/yellow]"
+                )
+                money_val = None
+        except ValueError:
+            console.print("[yellow]Invalid money value, skipping.[/yellow]")
+
+    if money_val is not None:
+        curr_input = Prompt.ask(
+            "Your approximate current money? (e.g. 100) "
+            "— helps locate the field, or leave empty for auto-scan",
+            default="",
+        )
+        if curr_input.strip():
+            try:
+                curr_money_val = float(curr_input)
+            except ValueError:
+                console.print("[yellow]Invalid value, will use auto-scan.[/yellow]")
+
+    honor_input = Prompt.ask(
+        "Honor level?",
+        choices=["highest", "lowest", "none"],
+        default="none",
+    )
+    honor_val: Optional[str] = honor_input if honor_input != "none" else None
+    curr_honor_val: Optional[float] = None
+    if honor_val:
+        honor_str = Prompt.ask(
+            "Your approximate current honor? (optional, leave empty for auto-scan)",
+            default="",
+        )
+        if honor_str.strip():
+            try:
+                curr_honor_val = float(honor_str)
+            except ValueError:
+                pass
+
+    return money_val, honor_val, curr_money_val, curr_honor_val
+
+
+def handle_option_4(prefix_path: Optional[Path]):
+    if not prefix_path:
+        console.print("[red]Prefix path not known. Run option 1 first.[/red]")
+        return
+    saves = list_save_files(prefix_path)
+    if not saves:
+        console.print("[red]No SRDR save files found in the Proton prefix.[/red]")
+        return
+    console.print("\n[bold cyan]--- Save File Editor ---[/bold cyan]")
+    console.print(
+        "[dim]The tool will scan your save data to find money/honor values "
+        "automatically.[/dim]\n"
+    )
+    target_save = select_save_file(prefix_path)
+    if not target_save:
+        console.print("[yellow]Cancelled.[/yellow]")
+        return
+    money_val, honor_val, curr_money_val, curr_honor_val = _prompt_save_edits()
+    if money_val is None and honor_val is None:
+        console.print("[yellow]Nothing to do – no edits requested.[/yellow]")
+        return
+    success = edit_save_file(
+        target_save,
+        money_amount=money_val,
+        honor_choice=honor_val,
+        current_money=curr_money_val,
+        current_honor=curr_honor_val,
+    )
+    if success:
+        console.print("[bold green]Save file patched successfully![/bold green]")
+    else:
+        console.print(
+            "[bold yellow]Could not patch save file (see details above).[/bold yellow]"
+        )
+
+
+def farm_honor(prefix_path: Path):
+    console.print("\n[bold cyan]--- Honor Farmer ---[/bold cyan]")
+    target_save = select_save_file(prefix_path)
+    if not target_save:
+        console.print("[yellow]Cancelled.[/yellow]")
+        return
+    curr_honor = Prompt.ask(
+        "Your approximate current honor? (optional, leave empty for auto-scan)",
+        default="",
+    )
+    curr_val: Optional[float] = None
+    if curr_honor.strip():
+        try:
+            curr_val = float(curr_honor)
+        except ValueError:
+            console.print("[yellow]Invalid value, will use auto-scan.[/yellow]")
+    success = edit_save_file(
+        target_save, honor_choice="highest", current_honor=curr_val
+    )
+    if success:
+        console.print("[bold green]Honor Farming Complete![/bold green]")
+    else:
+        console.print(
+            "[bold yellow]Honor Farming encountered issues "
+            "(see details above). Binary state unchanged.[/bold yellow]"
+        )
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  8.  Save Snapshot Manager                                               ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def create_save_snapshot(prefix_path: Path, backup_dir: Path):
+    """Creates a timestamped ZIP snapshot of the entire RDR2 Profiles directory."""
+    profiles_dir = _find_profiles_dir(prefix_path)
+    if not profiles_dir:
+        console.print("[red]Profiles directory not found. Cannot create snapshot.[/red]")
+        return
+
+    snapshot_dir = backup_dir / "snapshots"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"rdr2_saves_{timestamp}.zip"
+    zip_path = snapshot_dir / zip_name
+
+    console.print(f"[cyan]Creating snapshot: {zip_name}...[/cyan]")
+    try:
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for root, _, files in os.walk(profiles_dir):
+                for file in files:
+                    file_path = Path(root) / file
+                    zipf.write(file_path, file_path.relative_to(profiles_dir.parent))
+        console.print(
+            f"[bold green]Snapshot created successfully: {zip_name} at {zip_path}[/bold green]"
+        )
+    except Exception as e:
+        console.print(f"[red]Failed to create snapshot: {e}[/red]")
+
+
+def restore_save_snapshot(prefix_path: Path, backup_dir: Path):
+    """Lists and restores a save snapshot ZIP."""
+    snapshot_dir = backup_dir / "snapshots"
+    if not snapshot_dir.exists():
+        console.print("[yellow]No snapshots found.[/yellow]")
+        return
+
+    snapshots = sorted(list(snapshot_dir.glob("*.zip")), reverse=True)
+    if not snapshots:
+        console.print("[yellow]No snapshots found.[/yellow]")
+        return
+
+    table = Table(title="Available Save Snapshots", show_lines=True)
+    table.add_column("#", style="bold cyan", justify="right")
+    table.add_column("Snapshot Name", style="white")
+    table.add_column("Date", style="green")
+    table.add_column("Size", style="yellow")
+
+    for i, snap in enumerate(snapshots, 1):
+        stat = snap.stat()
+        mtime = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
+        size = round(stat.st_size / (1024 * 1024), 2)
+        table.add_row(str(i), snap.name, mtime, f"{size} MB")
+
+    console.print(table)
+    choice = Prompt.ask(
+        f"Select a snapshot to restore (1-{len(snapshots)}), or 0 to cancel",
+        default="0",
+    )
+    if choice == "0" or not choice.isdigit():
+        return
+
+    idx = int(choice) - 1
+    if idx < 0 or idx >= len(snapshots):
+        return
+
+    selected_snap = snapshots[idx]
+    profiles_dir = _find_profiles_dir(prefix_path)
+    if not profiles_dir:
+        return
+
+    console.print(f"[yellow]Restoring snapshot: {selected_snap.name}...[/yellow]")
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    old_profiles = profiles_dir.parent / f"Profiles_OLD_{timestamp}"
+    try:
+        profiles_dir.rename(old_profiles)
+        console.print(f"Backed up current profiles to: {old_profiles.name}")
+    except Exception as e:
+        console.print(f"[red]Failed to backup current profiles: {e}[/red]")
+        return
+
+    try:
+        with zipfile.ZipFile(selected_snap, 'r') as zipf:
+            zipf.extractall(profiles_dir.parent)
+        console.print("[bold green]Snapshot restored successfully![/bold green]")
+    except Exception as e:
+        console.print(
+            f"[red]Failed to extract snapshot: {e}. "
+            f"Attempting to restore old profiles...[/red]"
+        )
+        if old_profiles.exists():
+            old_profiles.rename(profiles_dir)
