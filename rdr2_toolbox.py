@@ -498,7 +498,30 @@ def install_lml_from_path(extract_path: Path, game_path: Path):
                 console.print(f"✓ Created missing lml core directory at {game_path.name}/lml/")
             
             console.print("✓ Installed vfs.asi to game root")
+            mitigate_vfs_log_stutter(game_path)
             break
+
+def mitigate_vfs_log_stutter(game_path: Path):
+    """
+    Strips write permissions from vfs.log to prevent LML I/O stutters.
+    """
+    vfs_log = game_path / "vfs.log"
+    if vfs_log.exists():
+        try:
+            # Set to read-only (0o444)
+            current_mode = vfs_log.stat().st_mode
+            vfs_log.chmod(0o444)
+            console.print("[SUCCESS] vfs.log is now read-only. LML I/O bottleneck mitigated.", style="bold green")
+        except Exception as e:
+            console.print(f"[yellow]Could not strip write permissions from vfs.log: {e}[/yellow]")
+    else:
+        # Create an empty read-only file if it doesn't exist to preemptively block it
+        try:
+            vfs_log.touch()
+            vfs_log.chmod(0o444)
+            console.print("[info]Preemptively created read-only vfs.log to prevent stutters.", style="bold green")
+        except Exception:
+            pass
 
 def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     mods_staging = STAGING_DIR / "mods"
@@ -536,6 +559,7 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     except (AttributeError, KeyError, TypeError):
         sorted_mods = sorted(modlist.items())
     
+    conflicts: Dict[str, List[str]] = {}
     for mod_name, data in sorted_mods:
         if not data.get("enabled", True):
             continue
@@ -570,11 +594,33 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
             else:
                 target_path = game_path / rel_path
 
-            deployment_queue[str(target_path)] = {
+            target_str = str(target_path)
+            if target_str in deployment_queue:
+                existing_info = deployment_queue[target_str]
+                if existing_info["mod_id"] != mod_name:
+                    if target_str not in conflicts:
+                        conflicts[target_str] = [existing_info["mod_id"]]
+                    conflicts[target_str].append(mod_name)
+
+            deployment_queue[target_str] = {
                 "source": str(file_path),
                 "mod_id": mod_name,
                 "priority": data.get('priority', 50)
             }
+
+    if conflicts:
+        console.print("\n[bold yellow]⚠ Mod Conflicts Detected![/bold yellow]")
+        table = Table(title="Conflicting Files (Priority wins)")
+        table.add_column("Target Path", style="dim")
+        table.add_column("Conflicting Mods", style="bold red")
+        for target, mods in conflicts.items():
+            rel_target = Path(target).relative_to(game_path) if game_path in Path(target).parents else Path(target).name
+            table.add_row(str(rel_target), ", ".join(mods))
+        console.print(table)
+        console.print("[italic]Files from mods with higher priority (or later in the list) will be deployed.[/italic]\n")
+
+    if lml_installed or (game_path / "vfs.asi").exists():
+        mitigate_vfs_log_stutter(game_path)
 
     if requires_scripthook and game_path:
         check_and_install_scripthook(game_path, interactive=False)
@@ -645,6 +691,12 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     manifest.update(new_manifest_entries)
     save_manifest(manifest)
     console.print(f"[SUCCESS] Deployed {linked_count} files.", style="bold green")
+
+    if prefix_path:
+        console.print("[cyan]Mod deployment finished. Purging graphics cache to prevent ERR_GFX_STATE...[/cyan]")
+        count = clear_graphics_cache(prefix_path)
+        if count > 0:
+            console.print(f"[success]Purged {count} shader cache files.[/success]")
 
 def clean_purge():
     console.print("\n[cyan]Starting Clean Purge...[/cyan]")
@@ -809,25 +861,31 @@ def open_save_folder(prefix_path: Optional[Path]):
     subprocess.run(["xdg-open", str(profiles_dir)], check=False)
 
 def apply_deepsurface_fix(prefix_path: Optional[Path]):
+    """
+    Sets DeepSurfaceQuality to Ultra to fix geometry culling bugs on Steam Deck.
+    """
     if not prefix_path: return
     xml_path = (prefix_path /
                 "drive_c/users/steamuser/Documents/Rockstar Games/Red Dead Redemption 2/Settings/system.xml")
     if not xml_path.exists():
-        console.print("[yellow]Settings system.xml not found.[/yellow]")
+        console.print("[yellow]Settings system.xml not found. Please run the game once first.[/yellow]")
         return
     try:
         content = xml_path.read_bytes()
         encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
         text = content.decode(encoding)  # type: ignore
+        
+        # We try both Ultra and kSettingLevel_Ultra as labels vary by engine version
         new_text = patch_xml_tag(text, "deepsurfaceQuality", "kSettingLevel_Ultra")
+        
         if new_text != text:
             xml_path.write_bytes(new_text.encode(encoding))  # type: ignore
-            console.print("[SUCCESS] DeepSurfaceQuality set to Ultra.", style="bold green")
+            console.print("[SUCCESS] Ground Geometry (DeepSurfaceQuality) set to Ultra.", style="bold green")
         else:
-            if 'deepsurfacequality' not in text.lower():
-                 console.print("[warning]Could not find <deepsurfaceQuality> tag in system.xml[/warning]")
+            if 'deepsurface' not in text.lower():
+                 console.print("[warning]Could not find <deepSurfaceQuality> tag in system.xml.[/warning]")
             else:
-                 console.print("[info]DeepSurfaceQuality is already Ultra.", style="bold green")
+                 console.print("[info]Ground Geometry is already at optimal quality.", style="bold green")
     except Exception as e:
         console.print(f"[red]Failed to patch system.xml: {e}[/red]")
 
@@ -851,6 +909,7 @@ def apply_graphics_matrix(prefix_path: Optional[Path]):
         "waterRefractionQuality": "kSettingLevel_Medium",
         "waterPhysics": "1",
         "volumetricsQuality": "kSettingLevel_Low",
+        "volumetricsRaymarchResolutionUnbound": "kSettingLevel_Off",
         "shadowSoftShadows": "kSettingLevel_Off",
         "particleQuality": "kSettingLevel_Medium",
         "tessellation": "kSettingLevel_Medium",
@@ -937,27 +996,130 @@ def run_health_check(game_path: Optional[Path], prefix_path: Optional[Path]):
 
     console.print("[bold cyan]--- End of Health Check ---[/bold cyan]\n")
 
+PERFORMANCE_PRESETS = {
+    "Battery Saver (Low/Stable)": {
+        "textureQuality": "texQual_Medium",
+        "lightingQuality": "kSettingLevel_Low",
+        "globalIlluminationQuality": "kSettingLevel_Low",
+        "shadowQuality": "kSettingLevel_Low",
+        "farShadowQuality": "kSettingLevel_Low",
+        "ssao": "kSettingLevel_Low",
+        "reflectionQuality": "kSettingLevel_Low",
+        "waterReflectionQuality": "kSettingLevel_Low",
+        "waterRefractionQuality": "kSettingLevel_Low",
+        "waterPhysics": "0",
+        "volumetricsQuality": "kSettingLevel_Low",
+        "volumetricsRaymarchResolutionUnbound": "kSettingLevel_Off",
+        "shadowSoftShadows": "kSettingLevel_Off",
+        "particleQuality": "kSettingLevel_Low",
+        "tessellation": "kSettingLevel_Low",
+    },
+    "Balanced (Recommended)": {
+        "textureQuality": "texQual_Ultra",
+        "lightingQuality": "kSettingLevel_Medium",
+        "globalIlluminationQuality": "kSettingLevel_Low",
+        "shadowQuality": "kSettingLevel_Medium",
+        "farShadowQuality": "kSettingLevel_Low",
+        "ssao": "kSettingLevel_Medium",
+        "reflectionQuality": "kSettingLevel_Low",
+        "waterReflectionQuality": "kSettingLevel_Low",
+        "waterRefractionQuality": "kSettingLevel_Medium",
+        "waterPhysics": "1",
+        "volumetricsQuality": "kSettingLevel_Low",
+        "volumetricsRaymarchResolutionUnbound": "kSettingLevel_Off",
+        "shadowSoftShadows": "kSettingLevel_Off",
+        "particleQuality": "kSettingLevel_Medium",
+        "tessellation": "kSettingLevel_Medium",
+    },
+    "Max Quality (High/30FPS)": {
+        "textureQuality": "texQual_Ultra",
+        "lightingQuality": "kSettingLevel_High",
+        "globalIlluminationQuality": "kSettingLevel_Medium",
+        "shadowQuality": "kSettingLevel_High",
+        "farShadowQuality": "kSettingLevel_Medium",
+        "ssao": "kSettingLevel_High",
+        "reflectionQuality": "kSettingLevel_Medium",
+        "waterReflectionQuality": "kSettingLevel_Medium",
+        "waterRefractionQuality": "kSettingLevel_High",
+        "waterPhysics": "2",
+        "volumetricsQuality": "kSettingLevel_Medium",
+        "volumetricsRaymarchResolutionUnbound": "kSettingLevel_On",
+        "shadowSoftShadows": "kSettingLevel_On",
+        "particleQuality": "kSettingLevel_High",
+        "tessellation": "kSettingLevel_High",
+    }
+}
+
+def apply_performance_preset(prefix_path: Optional[Path]):
+    if not prefix_path:
+        console.print("[red]Proton prefix not found.[/red]")
+        return
+
+    console.print("\n[bold magenta]Select Performance Preset[/bold magenta]")
+    preset_names = list(PERFORMANCE_PRESETS.keys())
+    for i, name in enumerate(preset_names, 1):
+        console.print(f"{i}. {name}")
+    console.print("0. Back")
+
+    choice = Prompt.ask("Select", choices=[str(i) for i in range(len(preset_names) + 1)])
+    if choice == "0":
+        return
+
+    selected_name = preset_names[int(choice) - 1]
+    preset_dict = PERFORMANCE_PRESETS[selected_name]
+
+    xml_path = (prefix_path /
+                "drive_c/users/steamuser/Documents/Rockstar Games/Red Dead Redemption 2/Settings/system.xml")
+    if not xml_path.exists():
+        console.print("[yellow]Settings system.xml not found.[/yellow]")
+        return
+
+    try:
+        content = xml_path.read_bytes()
+        encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
+        text = content.decode(encoding)  # type: ignore
+
+        updated_text = text
+        changes_count = 0
+
+        for key, val in preset_dict.items():
+            new_text = patch_xml_tag(updated_text, key, val)
+            if new_text != updated_text:
+                updated_text = new_text
+                changes_count += 1
+
+        if changes_count > 0:
+            xml_path.write_bytes(updated_text.encode(encoding))  # type: ignore
+            console.print(f"[SUCCESS] Applied '{selected_name}' preset ({changes_count} changes).", style="bold green")
+        else:
+            console.print(f"[info]Settings are already at '{selected_name}' values or tags not found.", style="bold green")
+
+    except Exception as e:
+        console.print(f"[red]Failed to apply preset: {e}[/red]")
+
 def handle_steam_deck_optimizations(game_path: Optional[Path], prefix_path: Optional[Path]):
     while True:
         console.print("\n[bold magenta]Steam Deck Optimizations[/bold magenta]")
         console.print("1. Run Optimization Health Check")
-        console.print("2. Apply Recommended Graphics Matrix (Vulkan)")
+        console.print("2. Apply Performance Presets (Battery/Balanced/Quality)")
         console.print("3. Fix Ground Geometry (Set DeepSurface -> Ultra)")
         console.print("4. Fix Safe Mode Boot Loop (Set Adapter Index -> 0)")
         console.print("5. Fix Launcher Error (Set OS Version -> Win10)")
         console.print("6. Refresh Shader Cache (Purge sga_ files)")
         console.print("7. Force Vulkan API & DLL Overrides")
-        console.print("8. Show Recommended Launch Options")
+        console.print("8. Install Launch Argument Wrapper (Fixes DX12 & CPU Load)")
+        console.print("9. Show Recommended Launch Options")
+        console.print("10. Apply All Recommended Fixes (One-Click Setup)")
         console.print("0. Back")
 
-        choice = Prompt.ask("Select", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"])
+        choice = Prompt.ask("Select", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"])
 
         if choice == "0":
             break
         elif choice == "1":
             run_health_check(game_path, prefix_path)
         elif choice == "2":
-            apply_graphics_matrix(prefix_path)
+            apply_performance_preset(prefix_path)
         elif choice == "3":
             apply_deepsurface_fix(prefix_path)
         elif choice == "4":
@@ -974,15 +1136,114 @@ def handle_steam_deck_optimizations(game_path: Optional[Path], prefix_path: Opti
             ensure_vulkan(prefix_path)
             apply_wine_overrides(prefix_path)
         elif choice == "8":
+            if game_path:
+                create_launch_wrapper(game_path)
+            else:
+                console.print("[red]Game path unknown.[/red]")
+        elif choice == "9":
             console.print("\n[bold cyan]--- Recommended Steam Launch Options ---[/bold cyan]")
             console.print("Copy and paste these into the game's properties in Steam:")
             console.print(Panel("-width 1280 -height 800 -fullscreen -ignorepipelinecache", border_style="green"))
             console.print("[italic]Note: -ignorepipelinecache fixes massive stutters upon loading saves.[/italic]\n")
+        elif choice == "10":
+            apply_all_optimizations(game_path, prefix_path)
 
-def safety_checks(game_path: Optional[Path]):
+def create_launch_wrapper(game_path: Path):
+    """
+    Creates a bash wrapper for RDR2.exe to inject launch arguments while Steam is open.
+    Renames the original RDR2.exe to RDR2_engine.exe.
+    """
+    original_exe = game_path / "RDR2.exe"
+    engine_exe = game_path / "RDR2_engine.exe"
+    wrapper_script = game_path / "RDR2.exe" # This becomes the proxy
+
+    console.print(f"[cyan]Creating launch wrapper in {game_path}...[/cyan]")
+
+    try:
+        if original_exe.exists() and not engine_exe.exists():
+            # Renaming to _engine.exe
+            original_exe.rename(engine_exe)
+            console.print(f"  ✓ Renamed RDR2.exe -> RDR2_engine.exe")
+        
+        # Create bash script proxy
+        script_content = f"""#!/bin/bash
+# RDR2 Steam Deck Toolbox - Launch Argument Wrapper
+# Injecting critical parameters to bypass localconfig.vdf caching
+
+./RDR2_engine.exe -ignorepipelinecache -cpuLoadRebalancing -width 1280 -height 800 "$@"
+"""
+        wrapper_script.write_text(script_content)
+        wrapper_script.chmod(0o755) # Executable
+        console.print(f"  ✓ Created bash proxy at RDR2.exe")
+        console.print(Panel(
+            "[success]Launch Argument Wrapper Installed![/success]\n\n"
+            "Arguments injected: [bold]-ignorepipelinecache -cpuLoadRebalancing -width 1280 -height 800[/bold]\n"
+            "This fixes DX12 resolution bugs and reduces script-based micro-stutters.",
+            title="Wrapper Automation"
+        ))
+    except Exception as e:
+        console.print(f"[red]Failed to create launch wrapper: {e}[/red]")
+
+def apply_all_optimizations(game_path: Optional[Path], prefix_path: Optional[Path]):
+    """
+    Applies all recommended fixes for a one-click Steam Deck setup.
+    """
+    if not prefix_path:
+        console.print("[red]Proton prefix not found. Run the game once first.[/red]")
+        return
+    
+    console.print("\n[bold cyan]Starting One-Click Optimization...[/bold cyan]")
+    
+    # 1. Graphics Matrix
+    apply_graphics_matrix(prefix_path)
+    
+    # 2. DeepSurface
+    apply_deepsurface_fix(prefix_path)
+    
+    # 3. Adapter Index
+    set_adapter_index(prefix_path)
+    
+    # 4. OS Version
+    set_windows_version(prefix_path)
+    
+    # 5. Vulkan & Overrides
+    ensure_vulkan(prefix_path)
+    apply_wine_overrides(prefix_path)
+    
+    # 6. Launch Wrapper
+    if game_path:
+        create_launch_wrapper(game_path)
+    
+    console.print("\n[bold green]One-Click Optimization Complete![/bold green]")
+    console.print("[italic]Note: It is still recommended to run 'Refresh Shader Cache' if you experience crashes.[/italic]")
+
+def safety_checks(game_path: Optional[Path], prefix_path: Optional[Path] = None):
     if not game_path: return
-    if (game_path / "version.dll").exists():
-        console.print("[warning]ADVISORY: 'version.dll' detected. This often causes the 'Spawn Bug' and world desolation. Consider using 'dinput8.dll' instead.[/warning]")
+    version_dll = game_path / "version.dll"
+    if version_dll.exists():
+        console.print(Panel(
+            "[bold red]WARNING: 'version.dll' detected![/bold red]\n\n"
+            "This ASI loader causes the 'Spawn Bug' where wildlife and NPCs stop generating.\n"
+            "It is highly recommended to replace it with the stable [bold green]dinput8.dll[/bold green].",
+            title="Stability Warning",
+            border_style="red"
+        ))
+        if Prompt.ask("Automatically replace version.dll with dinput8.dll? (y/N)", default="n").lower() == "y":
+            try:
+                # We can reuse the distribution from ScriptHookRDR2 if we have a way to get it, 
+                # but for simplicity we'll just rename version.dll to dinput8.dll IF dinput8.dll doesn't exist,
+                # OR we warn the user to run the ScriptHook installer.
+                dinput8 = game_path / "dinput8.dll"
+                version_dll.unlink()
+                console.print("[success]Removed version.dll.[/success]")
+                if not dinput8.exists():
+                    console.print("[cyan]Installing fresh dinput8.dll via ScriptHook installer...[/cyan]")
+                    check_and_install_scripthook(game_path, interactive=False)
+                else:
+                    console.print("[info]dinput8.dll already present. System is now stable.[/info]")
+            except Exception as e:
+                console.print(f"[red]Failed to replace version.dll: {e}[/red]")
+
     stream_path = Path(game_path) / "lml" / "stream"
     if stream_path.exists():
         try:

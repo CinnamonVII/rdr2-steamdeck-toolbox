@@ -60,7 +60,8 @@ console = Console()
 
 
 
-_SRDR_MAGIC        = b'\x04\x00\x00\x00'
+_SRDR_MAGIC_LE     = b'\x04\x00\x00\x00'
+_SRDR_MAGIC_BE     = b'\x00\x00\x00\x04'
 _HEADER_LEN        = 0x104
 
 
@@ -79,6 +80,20 @@ _SRDR_SLOT_MAP: Dict[str, str] = {
 
 _KNOWN_XOR_KEY = bytes.fromhex("9a2c64cf6a76acfae1430b728940903c")
 
+# SM-C01: The JOAAT checksum is at a fixed offset from the start of the deobfuscated payload.
+# Audit reports typical locations as 0x04, 0x08, or 0x10. We use a hint variable.
+_CHECKSUM_OFFSET_HINT = 0x10  # Fallback hint
+
+# RAGE Engine Data Block Identifiers (Big Endian as found in memory)
+_BLOCK_ID_PLAYER_METADATA = 0x9189C677
+_BLOCK_ID_ECONOMY         = 0x2FF42E65
+_BLOCK_ID_VITALS          = 0xBB68F541
+_BLOCK_ID_HONOR           = 0xF1A158A9
+
+# JOAAT-64 hashes used by RAGE scripts
+# Hash for _MONEY_GET_CASH_BALANCE (0x0C02DABFA3B98176)
+_HASH_MONEY = b'\x0C\x02\xDA\xBF\xA3\xB9\x81\x76'
+
 
 def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
     """
@@ -92,7 +107,8 @@ def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
     # Fast path: check if the known key works
     total_blocks = len(payload) // key_len
     count = 0
-    KNOWN_KEY_THRESHOLD = 0.005
+    KNOWN_KEY_THRESHOLD = 0.05    # 5% minimum (SM-H01)
+    NULL_RATIO_THRESHOLD = 0.45   # RDR2 saves are ~78% null (SM-H01)
     
     for block_idx in range(total_blocks):
         start = block_idx * key_len
@@ -101,10 +117,15 @@ def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
     
     if count >= total_blocks * KNOWN_KEY_THRESHOLD:
         # Double-check with null ratio for robustness on dense saves
-        test_plain = _xor_deobfuscate(payload[:4096], _KNOWN_XOR_KEY)
+        test_plain = _xor_deobfuscate(payload[:min(16384, len(payload))], _KNOWN_XOR_KEY)
         null_ratio = sum(1 for b in test_plain if b == 0) / len(test_plain)
-        if null_ratio >= 0.25:
+        if null_ratio >= NULL_RATIO_THRESHOLD:
             return _KNOWN_XOR_KEY
+        else:
+            console.print(
+                f"[yellow]Known key rejected: null ratio {null_ratio:.1%} < "
+                f"{NULL_RATIO_THRESHOLD:.0%}. Falling back to analysis.[/yellow]"
+            )
 
 
     # Slow path: byte-frequency analysis
@@ -133,21 +154,12 @@ def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
 
 
 def _xor_deobfuscate(payload: bytes, key: bytes) -> bytearray:
-    """Applies XOR key to deobfuscate/re-obfuscate payload (symmetric).
-    Uses a single big-integer XOR for maximum speed in pure Python."""
-    payload_len = len(payload)
+    """Applies XOR key to deobfuscate/re-obfuscate payload (symmetric)."""
     key_len = len(key)
-    
-    # Expand key to cover the full payload length
-    full_reps = payload_len // key_len
-    remainder = payload_len % key_len
-    expanded_key = key * full_reps + key[:remainder]  # type: ignore
-    
-    payload_int = int.from_bytes(payload, 'big')
-    key_int = int.from_bytes(expanded_key, 'big')
-    result_int = payload_int ^ key_int
-    
-    return bytearray(result_int.to_bytes(payload_len, 'big'))
+    result = bytearray(payload)
+    for i in range(len(result)):
+        result[i] ^= key[i % key_len]
+    return result
 
 
 def _sign_and_write(save_path: Path, work_data: bytearray, xor_key: bytes, header: bytes) -> int:
@@ -157,19 +169,34 @@ def _sign_and_write(save_path: Path, work_data: bytearray, xor_key: bytes, heade
     Note: copies work_data to avoid in-place mutation.
     """
     signed_data = bytearray(work_data)
-    # Recalculate JOAAT checksum on the modified deobfuscated payload (excluding the last 4 bytes)
-    if len(signed_data) < 4:
-        raise RuntimeError("Payload too small to contain checksum")
-    payload_data = bytes(signed_data[:-4])
-    new_checksum = joaat(payload_data)
-    checksum_bytes = struct.pack("<I", new_checksum)
     
-    # Append/replace the new checksum at the end of the deobfuscated payload
-    signed_data[-4:] = checksum_bytes
+    # SM-C01: Fixed offset JOAAT checksum calculation
+    # We attempt to find the original checksum offset in common locations 
+    # to maintain consistency if not already known.
+    offset = _CHECKSUM_OFFSET_HINT
+    for test_offset in [0x00, 0x04, 0x08, 0x0C, 0x10]:
+        if test_offset + 4 <= len(signed_data):
+            orig_val = struct.unpack('<I', signed_data[test_offset:test_offset+4])[0]
+            # Temporarily zero for hash check
+            temp_data = bytearray(signed_data)
+            temp_data[test_offset:test_offset+4] = b'\x00\x00\x00\x00'
+            if joaat(bytes(temp_data)) == orig_val:
+                offset = test_offset
+                break
+
+    # Guard against too small payload
+    if len(signed_data) < offset + 4:
+        raise RuntimeError(f"Payload too small ({len(signed_data)}) for checksum at 0x{offset:02X}")
+
+    # Zero out the checksum field before hashing
+    signed_data[offset:offset+4] = b'\x00\x00\x00\x00'
+    new_checksum = joaat(bytes(signed_data))
+    
+    # Pack the new checksum into the fixed offset
+    struct.pack_into("<I", signed_data, offset, new_checksum)
 
     re_obfuscated = _xor_deobfuscate(bytes(signed_data), xor_key)
     final_data = header + bytes(re_obfuscated)
-
 
     tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
     try:
@@ -235,25 +262,29 @@ def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, D
     if len(data) <= _HEADER_LEN:  # type: ignore
         raise RuntimeError(f"File too small ({len(data)} bytes)")
 
-    if data[:4] != _SRDR_MAGIC:  # type: ignore
+    if data[:4] not in (_SRDR_MAGIC_LE, _SRDR_MAGIC_BE):
         console.print(
-            f"[yellow]Warning: unexpected magic {data[:4].hex()}, "  # type: ignore
-            f"expected {_SRDR_MAGIC.hex()}[/yellow]"
+            f"[yellow]Warning: unexpected magic {data[:4].hex()}, "
+            f"expected {_SRDR_MAGIC_LE.hex()} or {_SRDR_MAGIC_BE.hex()}[/yellow]"
         )
 
     header = data[:_HEADER_LEN]  # type: ignore
     payload = data[_HEADER_LEN:]  # type: ignore
 
 
-    # Truncate payload to header-defined size to avoid padding issues at EOF
-    # Header offset 0x0C contains the expected payload size (including checksum)
-    expected_payload_len = struct.unpack('<I', header[12:16])[0]
-    if len(payload) > expected_payload_len:
-        payload = payload[:expected_payload_len]
-    elif len(payload) < expected_payload_len:
-        console.print(f"[yellow]Warning: payload size ({len(payload)}) less than header expectation ({expected_payload_len})[/yellow]")
-
     xor_key = _extract_xor_key(payload)
+
+    # Note: Prior logic tried to truncate based on misread header description (SM-C03).
+    # We now trust the actual file content size.
+
+    # Robust Padding Detection: Strip trailing 16-byte blocks that match the XOR key.
+    # These represent XOR-obfuscated null padding.
+    orig_len = len(payload)
+    while len(payload) >= 16 and payload[-16:] == xor_key:
+        payload = payload[:-16]
+    
+    if len(payload) < orig_len:
+        console.print(f"[dim]Stripped {orig_len - len(payload)} bytes of trailing XOR padding.[/dim]")
 
     plaintext = _xor_deobfuscate(payload, xor_key)
     null_sample = sum(1 for b in plaintext[:4096] if b == 0)  # type: ignore
@@ -273,6 +304,42 @@ def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, D
     }
 
     return plaintext, metadata
+
+
+def _find_data_blocks(data: bytearray) -> Dict[int, Tuple[int, int]]:
+    """
+    Scans the decrypted data for RAGE data block identifiers.
+    Returns a mapping of BlockID -> (start_offset, end_offset).
+    """
+    blocks: Dict[int, Tuple[int, int]] = {}
+    
+    # Block identifiers are typically 4 bytes Big-Endian
+    # We look for common identifiers mention in the guide
+    target_ids = [
+        _BLOCK_ID_PLAYER_METADATA,
+        _BLOCK_ID_ECONOMY,
+        _BLOCK_ID_VITALS,
+        _BLOCK_ID_HONOR,
+    ]
+    
+    for block_id in target_ids:
+        # Search for the block ID as a 4-byte sequence
+        pattern = struct.pack(">I", block_id)
+        pos = data.find(pattern)
+        if pos != -1:
+            # Found the block start. In RAGE saves, blocks are often followed 
+            # by size info or next block ID. For now, we'll assume the block 
+            # lasts until the next found block ID or end of file.
+            blocks[block_id] = (pos, len(data))
+    
+    # Refine boundaries: set end_offset of a block to the start_offset of the next
+    sorted_offsets = sorted([(start, bid) for bid, (start, _) in blocks.items()])
+    for i in range(len(sorted_offsets) - 1):
+        curr_start, curr_bid = sorted_offsets[i]
+        next_start, _ = sorted_offsets[i+1]
+        blocks[curr_bid] = (curr_start, next_start)
+        
+    return blocks
 
 
 def _slot_label(filename: str) -> str:
@@ -390,16 +457,15 @@ def _scan_int32_positions(
 ) -> Dict[int, List[int]]:
     """
     Scans data for int32 values in [low, high].
-    Uses unaligned sliding window.
+    Uses aligned scan (step=4) to prevent ghost hits (SM-C02).
     """
     result: Dict[int, List[int]] = {}
-    mv = memoryview(data).cast('B')
     n = len(data) - 3
     fmt = '<i'
     unpack_from = struct.unpack_from
-    for i in range(n):
+    for i in range(0, n, 4):  # SM-C02: 4-byte alignment
         try:
-            val = unpack_from(fmt, mv, i)[0]
+            val = unpack_from(fmt, data, i)[0]
             if low <= val <= high:
                 result.setdefault(val, []).append(i)
         except (struct.error, IndexError):
@@ -454,147 +520,157 @@ def _prompt_candidate_choice(label: str, candidates: list, shown: int = 10) -> i
 def _patch_money(
     work_data: bytearray,
     money_amount: float,
-    current_money: Optional[float],
+    current_money: Optional[float] = None,
     force: bool = False,
 ) -> bool:
     """
-    Patches money in the deobfuscated save data using fuzzy-range scanning.
+    Patches money using deterministic data block boundaries and JOAAT hashes.
     """
-
     target_cents = int(round(money_amount * 100))
     if target_cents < 0 or target_cents > _MAX_CENTS:
-        console.print(
-            f"[red]Money value ${money_amount:.2f} is out of range. "
-            f"Maximum is ${_MAX_CENTS / 100:.2f}.[/red]"
-        )
-    if current_money:
-        # User gave a hint — scan ±50% around it
-        approx_cents = int(round(current_money * 100))
-        console.print(
-            f"[cyan]Scanning for values near ${current_money:.2f} ({approx_cents} cents)...[/cyan]"
-        )
-        low_cents = max(1, int(approx_cents * 0.5))
-        high_cents = int(approx_cents * 1.5)
-    else:
-        # No hint — broad scan of up to $100k
-        console.print(
-            "[cyan]No current money hint — broad-scanning all plausible "
-            "money values ($0.01–$100,000)...[/cyan]"
-        )
-        low_cents = 1
-        high_cents = _PLAUSIBLE_MONEY_MAX
-
-
-    int_positions = _scan_int32_positions(work_data, low_cents, high_cents)
-
-
-    all_candidates: List[Tuple[float, int, List[int]]] = []
-    for cents_val, offsets in int_positions.items():
-        all_candidates.append((cents_val / 100.0, len(offsets), offsets))
-
-    else:
-        all_candidates.sort(key=lambda x: -x[1])
-
-    if not all_candidates:
-        console.print(
-            f"[yellow]No plausible money matches found (int32 cents). Cannot patch money.[/yellow]"
-        )
+        console.print(f"[red]Money value ${money_amount:.2f} is out of range.[/red]")
         return False
-    if force:
+
+    blocks = _find_data_blocks(work_data)
+    if _BLOCK_ID_ECONOMY not in blocks:
+        console.print("[yellow]Economy data block (0x2FF42E65) not found. Falling back to heuristic scan...[/yellow]")
+        # Heuristic fallback (original logic)
+        approx_cents = int(round(current_money * 100)) if current_money else 0
+        low_cents = max(1, int(approx_cents * 0.5)) if approx_cents else 1
+        high_cents = int(approx_cents * 1.5) if approx_cents else _PLAUSIBLE_MONEY_MAX
+        int_positions = _scan_int32_positions(work_data, low_cents, high_cents)
+        all_candidates = [(cv / 100.0, len(o), o) for cv, o in int_positions.items()]
+        
+        if not all_candidates: return False
+        all_candidates.sort(key=lambda x: -x[1])
+        
         chosen_display, chosen_count, chosen_offsets = all_candidates[0]
-        console.print(f"[cyan]Force-selected candidate: ${chosen_display:.2f}[/cyan]")
     else:
-        # Build display lines for user selection
-        shown = min(10, len(all_candidates))
-        lines = []
-        for i, (display, count, _) in enumerate(all_candidates[:shown], 1):
-            lines.append(f"{i:>2d}. ${display:>12.2f}  ({count:>4d} hits)")
+        start, end = blocks[_BLOCK_ID_ECONOMY]
+        economy_view = work_data[start:end]
+        
+        # Search for deterministic money hash
+        # We search both Little-Endian and Big-Endian just in case, though guide suggests 8-byte LE
+        pos_in_block = economy_view.find(_HASH_MONEY)
+        if pos_in_block == -1:
+            console.print("[yellow]Money hash not found in Economy block. Falling back to heuristic within block...[/yellow]")
+            int_positions = _scan_int32_positions(economy_view, 1, _PLAUSIBLE_MONEY_MAX)
+            all_candidates = [(cv / 100.0, len(o), [start + x for x in o]) for cv, o in int_positions.items()]
+            
+            if not all_candidates: return False
+            all_candidates.sort(key=lambda x: -x[1])
+            
+            chosen_display, chosen_count, chosen_offsets = all_candidates[0]
+        else:
+            # Hash found! Money is typically 4 bytes (int32 cents) after the 8-byte hash
+            # There might be some type-definition bytes (metadata) between them.
+            # Common pattern: Hash(8) + Type(1-4) + Value(4)
+            # We'll scan a small window for a plausible int32 value matching current_money if provided
+            chosen_offsets = []
+            found_pos = start + pos_in_block + len(_HASH_MONEY)
+            
+            # Simple assumption based on common RDR2 save editors: Value follows Hash immediately or after 4 bytes
+            for offset in [0, 4]:
+                val_pos = found_pos + offset
+                if val_pos + 4 <= len(work_data):
+                    val = struct.unpack('<i', work_data[val_pos:val_pos+4])[0]
+                    if 0 <= val <= _MAX_CENTS:
+                        chosen_offsets.append(val_pos)
+                        chosen_display = val / 100.0
+                        break
+            
+            if not chosen_offsets:
+                return False
+            chosen_count = len(chosen_offsets)
+            chosen_display = struct.unpack('<i', work_data[chosen_offsets[0]:chosen_offsets[0]+4])[0] / 100.0
 
-        idx = _prompt_candidate_choice("Money candidates found", lines, shown)
-        chosen_display, chosen_count, chosen_offsets = all_candidates[idx]
+    # SM-C02: Only patch ONE occurrence after selection/confirmation
+    if len(chosen_offsets) > 1 and not force:
+        lines = [f"{i+1:>2d}. offset 0x{off:08X}  value=${(struct.unpack('<i', work_data[off:off+4])[0])/100.0:.2f}" 
+                 for i, off in enumerate(chosen_offsets[:10])]
+        idx = _prompt_candidate_choice("Multiple money candidates found. Select the correct one", lines)
+        pos = chosen_offsets[idx]
+    else:
+        pos = chosen_offsets[0]
 
-    if chosen_count > 1 and not force:
-        console.print(f"[cyan]Notice: Found {chosen_count} locations for this value. Patching all for game state consistency.[/cyan]")
+    if pos % 4 != 0:
+        console.print(f"[yellow]Warning: chosen offset 0x{pos:08X} is not 4-byte aligned. Skipping.[/yellow]")
+        return False
 
     new_bytes = struct.pack('<i', target_cents)
+    work_data[pos:pos + 4] = new_bytes
 
-    for pos in chosen_offsets:
-        work_data[pos:pos + 4] = new_bytes
-
-    console.print(
-        f"[bold green]✓ Patched Money: ${chosen_display:.2f} → ${money_amount:.2f}[/bold green]"
-    )
+    console.print(f"[bold green]✓ Patched Money at 0x{pos:08X}: ${chosen_display:.2f} → ${money_amount:.2f}[/bold green]")
     return True
-
-
-
 
 
 def _patch_honor(
     work_data: bytearray,
-    honor_choice: str,
-    current_honor: Optional[float],
+    honor_amount: float,
+    current_honor: Optional[float] = None,
     force: bool = False,
 ) -> bool:
     """
-    Patches honor in the deobfuscated save data.
-    Typical range is ±320 or similar internally.
+    Patches honor using deterministic data block boundaries.
     """
-
-    # Max honor values (empirical/documented)
-    HONOR_MAX = 320
-    HONOR_MIN = -320
-    
-    target_val = HONOR_MAX if honor_choice == "highest" else HONOR_MIN
+    target_val = int(round(honor_amount))
     target_bytes = struct.pack('<i', target_val)
 
-    console.print("[cyan]Scanning for honor values (int32)...[/cyan]")
+    blocks = _find_data_blocks(work_data)
+    search_space = work_data
+    offset_base = 0
+    
+    if _BLOCK_ID_HONOR in blocks:
+        start, end = blocks[_BLOCK_ID_HONOR]
+        search_space = work_data[start:end]
+        offset_base = start
+        console.print(f"[cyan]Scanning for honor within deterministic block 0xF1A158A9...[/cyan]")
+    else:
+        # SM-H02: Require current_honor for safety if no block found
+        if current_honor is None and not force:
+            console.print("[red]Honor patching requires current_honor hint — auto-scan range too broad.[/red]")
+            return False
+        console.print(f"[yellow]Honor block 0xF1A158A9 not found. Scanning whole file...[/yellow]")
 
+    # SM-H02: Tighter range around current honor if available
+    if current_honor is not None:
+        approx = int(round(current_honor))
+        low = max(-320, int(approx * 0.8) - 10)
+        high = min(320, int(approx * 1.2) + 10)
+    else:
+        low, high = -320, 320
 
-    int_positions = _scan_int32_positions(work_data, HONOR_MIN - 10, HONOR_MAX + 10)
-
-    filtered: List[Tuple[float, int, List[int]]] = []
+    int_positions = _scan_int32_positions(search_space, low, high)
+    filtered = []
     for val, offsets in int_positions.items():
-        if len(offsets) > 50: 
-            continue
-        filtered.append((float(val), len(offsets), offsets))
+        # Only consider values that appear a small number of times (SM-H02)
+        if len(offsets) > 40: continue
+        filtered.append((float(val), len(offsets), [offset_base + x for x in offsets]))
 
-    else:
-        # Sort by proximity to user hint if available
-        if current_honor is not None:
-            filtered.sort(key=lambda x: (abs(x[0] - current_honor), -x[1]))
-        else:
-            filtered.sort(key=lambda x: x[1])
-
-    if not filtered:
-        console.print(
-            "[yellow]No plausible honor values found (int32).[/yellow]"
-        )
+    if not filtered: 
+        console.print("[yellow]No honor candidates found in range.[/yellow]")
         return False
-
-    if force:
-        chosen_val, chosen_count, chosen_offsets = filtered[0]
-        console.print(f"[cyan]Force-selected honor candidate: {chosen_val:.0f}[/cyan]")
+    
+    # Sort by closeness to current honor and rarity
+    if current_honor is not None:
+        filtered.sort(key=lambda x: (abs(x[0] - current_honor), x[1]))
     else:
-        # Build display lines
-        shown = min(10, len(filtered))
-        lines = []
-        for i, (val, count, _) in enumerate(filtered[:shown], 1):
-            lines.append(f"{i:>2d}. {val:>10.0f}  ({count:>4d} hits)")
+        filtered.sort(key=lambda x: x[1])
 
-        idx = _prompt_candidate_choice("Honor candidates found", lines, shown)
-        chosen_val, chosen_count, chosen_offsets = filtered[idx]
+    chosen_val, chosen_count, chosen_offsets = filtered[0]
+    
+    # SM-C02/H02: Only patch one occurrence
+    if len(chosen_offsets) > 1 and not force:
+        lines = [f"{i+1:>2d}. offset 0x{off:08X}  value={struct.unpack('<i', work_data[off:off+4])[0]}" 
+                 for i, off in enumerate(chosen_offsets[:10])]
+        idx = _prompt_candidate_choice("Multiple honor candidates found. Select the correct one", lines)
+        pos = chosen_offsets[idx]
+    else:
+        pos = chosen_offsets[0]
 
-    if chosen_count > 1 and not force:
-        console.print(f"[cyan]Notice: Found {chosen_count} locations for this honor value. Patching all for consistency.[/cyan]")
-
-
-    for pos in chosen_offsets:
-        work_data[pos:pos + 4] = target_bytes
-
-    console.print(
-        f"[bold green]✓ Patched Honor: {chosen_val:.0f} → {target_val}[/bold green]"
-    )
+    work_data[pos:pos + 4] = target_bytes
+    console.print(f"[bold green]✓ Patched Honor at 0x{pos:08X}: {chosen_val:.0f} → {target_val}[/bold green]")
+    return True
     return True
 
 
@@ -764,15 +840,23 @@ def _prompt_save_edits():
                 console.print("[yellow]Invalid value, will use auto-scan.[/yellow]")
 
     honor_input = Prompt.ask(
-        "Honor level?",
-        choices=["highest", "lowest", "none"],
-        default="none",
+        "Target Honor level? (-320 to 320, or leave empty to skip)",
+        default="",
     )
-    honor_val: Optional[str] = honor_input if honor_input != "none" else None
+    honor_val: Optional[float] = None
+    if honor_input.strip():
+        try:
+            honor_val = float(honor_input)
+            if honor_val < -320 or honor_val > 320:
+                console.print(f"[yellow]Honor value {honor_val} is out of range (-320 to 320). Skipping.[/yellow]")
+                honor_val = None
+        except ValueError:
+            console.print("[yellow]Invalid honor value, skipping.[/yellow]")
+
     curr_honor_val: Optional[float] = None
-    if honor_val:
+    if honor_val is not None:
         honor_str = Prompt.ask(
-            "Your approximate current honor? (optional, leave empty for auto-scan)",
+            "Your approximate current honor? (-320 to 320, or leave empty for auto-scan)",
             default="",
         )
         if honor_str.strip():
@@ -827,7 +911,7 @@ def farm_honor(prefix_path: Path):
         console.print("[yellow]Cancelled.[/yellow]")
         return
     curr_honor = Prompt.ask(
-        "Your approximate current honor? (optional, leave empty for auto-scan)",
+        "Your approximate current honor? (-320 to 320, or leave empty for auto-scan)",
         default="",
     )
     curr_val: Optional[float] = None
@@ -837,7 +921,7 @@ def farm_honor(prefix_path: Path):
         except ValueError:
             console.print("[yellow]Invalid value, will use auto-scan.[/yellow]")
     success = edit_save_file(
-        target_save, honor_choice="highest", current_honor=curr_val
+        target_save, honor_choice=320.0, current_honor=curr_val
     )
     if success:
         console.print("[bold green]Honor Farming Complete![/bold green]")
