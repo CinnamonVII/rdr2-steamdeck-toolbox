@@ -135,7 +135,7 @@ def print_proton_setup(prefix: Optional[Path]):
         console.print("[yellow]Proton prefix not found. Cannot provide specific setup instructions.[/yellow]")
         return
 
-    console.print("\n[bold cyan]--- Proton Setup Instructions ---[/bold cyan]")
+    console.print("\n--- Proton Setup Instructions ---")
     if prefix.exists():
         console.print(f"[green]Prefix located at:[/green] {prefix}")
     else:
@@ -149,7 +149,6 @@ def print_proton_setup(prefix: Optional[Path]):
         "[bold green]WINEDLLOVERRIDES=\"dinput8=n,b;version=n,b;ScriptHookRDR2=n,b\" %command%[/bold green]\n\n"
         "This ensures the game loads the required modding libraries.",
         title="Proton Configuration",
-        border_style="green"
     ))
 
 def load_manifest() -> Dict[str, Any]:
@@ -795,7 +794,7 @@ def open_game_folder(game_path: Optional[Path]):
     if not game_path:
         console.print("[red]Game path unknown.[/red]")
         return
-    console.print(f"[cyan]Opening game folder: {game_path}[/cyan]")
+    console.print(f"Opening game folder: {game_path}")
     subprocess.run(["xdg-open", str(game_path)], check=False)
 
 def open_save_folder(prefix_path: Optional[Path]):
@@ -1550,9 +1549,7 @@ def handle_backup_manager(game_path: Optional[Path], prefix_path: Optional[Path]
                     deploy_mods(game_path, prefix_path)  # type: ignore  # type: ignore
 
 
-# ---------------------------------------------------------------------------
 # Menu
-# ---------------------------------------------------------------------------
 
 def handle_recommended_mods(game_path: Optional[Path], prefix_path: Optional[Path]):
     while True:
@@ -1744,16 +1741,13 @@ def create_desktop_shortcut():
     desktop_dir = Path.home() / "Desktop"
     applications_dir = Path.home() / ".local/share/applications"
     
-    # Ensure applications dir exists
     applications_dir.mkdir(parents=True, exist_ok=True)
     
-    # Path to the current script
     script_path = Path(__file__).resolve()
-    # Path to the python interpreter in the venv
     venv_python = script_path.parent / "venv" / "bin" / "python"
     
     if not venv_python.exists():
-        venv_python = sys.executable # Fallback to current python
+        venv_python = sys.executable
         
     terminal = next(
         (t for t in ["konsole", "gnome-terminal", "xterm", "foot"] if shutil.which(t)),
@@ -1776,12 +1770,10 @@ Categories=Game;Utility;
     desktop_file_name = "RDR2_Toolbox.desktop"
     
     try:
-        # Create in applications menu
         app_file = applications_dir / desktop_file_name
         app_file.write_text(desktop_content)
         app_file.chmod(0o755)
         
-        # Create on desktop if it exists
         if desktop_dir.exists():
             desktop_file = desktop_dir / desktop_file_name
             desktop_file.write_text(desktop_content)

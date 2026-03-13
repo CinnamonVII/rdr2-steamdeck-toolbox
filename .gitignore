@@ -17,3 +17,4 @@ simulation_box/
 token.txt
 release.sh
 delete_tag.sh
+tests

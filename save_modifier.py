@@ -9,7 +9,7 @@ Real SRDR PC save format (verified against 4 live save files):
   - After deobfuscation: raw binary game state (no compression). ~78% null
              bytes with dense data islands. Money stored as int32 cents.
 
-Public API (consumed by rdr2_toolbox.py):
+Public API:
     validate_and_sign_srdr, edit_save_file, list_save_files,
     select_save_file, handle_option_4, farm_honor,
     create_save_snapshot, restore_save_snapshot
@@ -57,18 +57,18 @@ except ImportError:
 
 console = Console()
 
-# Constants
 
-# SRDR header
+
+
 _SRDR_MAGIC        = b'\x04\x00\x00\x00'
 _HEADER_LEN        = 0x104
 
-# Max plausible money in cents (INT32_MAX)
+
 _MAX_CENTS = 2_147_483_647
-# Upper bound for a "plausible" money value in cents ($100,000)
+
 _PLAUSIBLE_MONEY_MAX = 10_000_000
 
-# SRDR slot index → human-readable label
+
 # Per the RAGE engine: SRDR30000–SRDR30014 = manual slots, SRDR30015 = autosave
 _SRDR_SLOT_MAP: Dict[str, str] = {
     **{f"SRDR{30000 + i:05d}": f"Manual Slot {i}" for i in range(15)},
@@ -76,7 +76,7 @@ _SRDR_SLOT_MAP: Dict[str, str] = {
 }
 
 
-# Known XOR key for SRDR format version 4 (verified across multiple saves)
+
 _KNOWN_XOR_KEY = bytes.fromhex("9a2c64cf6a76acfae1430b728940903c")
 
 
@@ -152,24 +152,34 @@ def _xor_deobfuscate(payload: bytes, key: bytes) -> bytearray:
 
 def _sign_and_write(save_path: Path, work_data: bytearray, xor_key: bytes, header: bytes) -> int:
     """
-    Centralized logic to sign, re-obfuscate and write an SRDR file.
+    Centralized logic to sign, re-obfuscate and write an SRDR file atomically.
     Returns the new checksum value.
     Note: copies work_data to avoid in-place mutation.
     """
     signed_data = bytearray(work_data)
-    # 1. Recalculate JOAAT checksum on the modified deobfuscated payload (excluding the last 4 bytes)
+    # Recalculate JOAAT checksum on the modified deobfuscated payload (excluding the last 4 bytes)
+    if len(signed_data) < 4:
+        raise RuntimeError("Payload too small to contain checksum")
     payload_data = bytes(signed_data[:-4])
     new_checksum = joaat(payload_data)
     checksum_bytes = struct.pack("<I", new_checksum)
     
-    # 2. Append/replace the new checksum at the end of the deobfuscated payload
+    # Append/replace the new checksum at the end of the deobfuscated payload
     signed_data[-4:] = checksum_bytes
 
     re_obfuscated = _xor_deobfuscate(bytes(signed_data), xor_key)
     final_data = header + bytes(re_obfuscated)
 
-    with open(save_path, 'wb') as f:
-        f.write(final_data)
+
+    tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+    try:
+        with open(tmp_path, 'wb') as f:
+            f.write(final_data)
+        os.replace(tmp_path, save_path)
+    except Exception as e:
+        if tmp_path.exists():
+            tmp_path.unlink(missing_ok=True)
+        raise e
     
     return new_checksum
 
@@ -181,17 +191,13 @@ def joaat(data: bytes) -> int:
     """
     hash_val = 0
     for byte in data:
-        hash_val += byte
-        hash_val &= 0xFFFFFFFF
-        hash_val += (hash_val << 10)
-        hash_val &= 0xFFFFFFFF
+        hash_val = (hash_val + byte) & 0xFFFFFFFF
+        hash_val = (hash_val + (hash_val << 10)) & 0xFFFFFFFF
         hash_val ^= (hash_val >> 6)
         
-    hash_val += (hash_val << 3)
-    hash_val &= 0xFFFFFFFF
+    hash_val = (hash_val + (hash_val << 3)) & 0xFFFFFFFF
     hash_val ^= (hash_val >> 11)
-    hash_val += (hash_val << 15)
-    hash_val &= 0xFFFFFFFF
+    hash_val = (hash_val + (hash_val << 15)) & 0xFFFFFFFF
     
     return hash_val
 
@@ -238,7 +244,7 @@ def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, D
     header = data[:_HEADER_LEN]  # type: ignore
     payload = data[_HEADER_LEN:]  # type: ignore
 
-    # Extract the XOR key from the payload
+
     xor_key = _extract_xor_key(payload)
 
     plaintext = _xor_deobfuscate(payload, xor_key)
@@ -441,7 +447,7 @@ def _patch_money(
     work_data: bytearray,
     money_amount: float,
     current_money: Optional[float],
-    force: bool = False, # BUG-N05: non-interactive mode
+    force: bool = False,
 ) -> bool:
     """
     Patches money in the deobfuscated save data using fuzzy-range scanning.
@@ -473,7 +479,7 @@ def _patch_money(
 
     int_positions = _scan_int32_positions(work_data, low_cents, high_cents)
 
-    # Merge: (display_value, count, offsets_list)
+
     all_candidates: List[Tuple[float, int, List[int]]] = []
     for cents_val, offsets in int_positions.items():
         all_candidates.append((cents_val / 100.0, len(offsets), offsets))
@@ -489,7 +495,11 @@ def _patch_money(
     if force:
         # Auto-pick the first one (usually the closest match due to sorting)
         chosen_display, chosen_count, chosen_offsets = all_candidates[0]
-        console.print(f"[cyan]Force-selected candidate #1: ${chosen_display:.2f}[/cyan]")
+        if chosen_count > 1:
+            console.print(f"[yellow]Force mode: found {chosen_count} hits, safely patching only the first occurrence.[/yellow]")
+            chosen_offsets = chosen_offsets[:1]
+        else:
+            console.print(f"[cyan]Force-selected candidate: ${chosen_display:.2f}[/cyan]")
     else:
         # Build display lines for user selection
         shown = min(10, len(all_candidates))
@@ -500,24 +510,22 @@ def _patch_money(
         idx = _prompt_candidate_choice("Money candidates found", lines, shown)
         chosen_display, chosen_count, chosen_offsets = all_candidates[idx]
 
-    if chosen_count > 10 and not force:
-        console.print(f"[yellow]Warning: {chosen_count} hits for this value. "
-                      "Patching all might corrupt unrelated data.[/yellow]")
-        confirm = Prompt.ask("Patch all occurrences? (y/N)", default="n")
-        if confirm.lower() != "y":
+    if chosen_count > 1 and not force:
+        console.print(f"[red]⚠ DANGER: Found {chosen_count} locations for this value. Patching all will corrupt your save![/red]")
+        confirm = Prompt.ask("Safely patch ONLY the first occurrence? (Y/n)", default="y")
+        if confirm.lower() != "n":
             chosen_offsets = chosen_offsets[:1]
-    elif chosen_count > 10 and force:
-        console.print(f"[yellow]Auto-patching: too many hits ({chosen_count}), limiting to first occurrence.[/yellow]")
-        chosen_offsets = chosen_offsets[:1]
-    new_bytes = struct.pack('<i', target_cents)
+        else:
+            console.print("[yellow]Aborting money patch to preserve save integrity.[/yellow]")
+            return False
 
+    new_bytes = struct.pack('<i', target_cents)
 
     for pos in chosen_offsets:
         work_data[pos:pos + 4] = new_bytes
 
     console.print(
-        f"[bold green]✓ Patched Money: ${chosen_display:.2f} → "
-        f"${money_amount:.2f} at {len(chosen_offsets)} location(s)[/bold green]"
+        f"[bold green]✓ Patched Money: ${chosen_display:.2f} → ${money_amount:.2f}[/bold green]"
     )
     return True
 
@@ -545,9 +553,10 @@ def _patch_honor(
 
     console.print("[cyan]Scanning for honor values (int32)...[/cyan]")
 
-    # Scan for int32 values in a reasonable honor range
+
     int_positions = _scan_int32_positions(work_data, HONOR_MIN - 10, HONOR_MAX + 10)
 
+    filtered: List[Tuple[float, int, List[int]]] = []
     for val, offsets in int_positions.items():
         if len(offsets) > 50: 
             continue
@@ -568,7 +577,11 @@ def _patch_honor(
 
     if force:
         chosen_val, chosen_count, chosen_offsets = filtered[0]
-        console.print(f"[cyan]Force-selected candidate #1: {chosen_val:.0f}[/cyan]")
+        if chosen_count > 1:
+            console.print(f"[yellow]Force mode: found {chosen_count} hits for honor, safely patching only the first.[/yellow]")
+            chosen_offsets = chosen_offsets[:1]
+        else:
+            console.print(f"[cyan]Force-selected honor candidate: {chosen_val:.0f}[/cyan]")
     else:
         # Build display lines
         shown = min(10, len(filtered))
@@ -579,24 +592,21 @@ def _patch_honor(
         idx = _prompt_candidate_choice("Honor candidates found", lines, shown)
         chosen_val, chosen_count, chosen_offsets = filtered[idx]
 
-
-    if chosen_count > 5 and not force:
-        console.print(f"[yellow]Warning: {chosen_count} hits for honor. Risk of corruption.[/yellow]")
-        confirm = Prompt.ask("Patch all occurrences? (y/N)", default="n")
-        if confirm.lower() != "y":
+    if chosen_count > 1 and not force:
+        console.print(f"[red]⚠ DANGER: Found {chosen_count} locations for this honor value.[/red]")
+        confirm = Prompt.ask("Safely patch ONLY the first occurrence? (Y/n)", default="y")
+        if confirm.lower() != "n":
             chosen_offsets = chosen_offsets[:1]
-    elif chosen_count > 5 and force:
-        console.print(f"[yellow]Auto-patching: too many hits ({chosen_count}) for honor, limiting to first.[/yellow]")
-        chosen_offsets = chosen_offsets[:1]
+        else:
+            console.print("[yellow]Aborting honor patch to preserve save integrity.[/yellow]")
+            return False
 
 
-    # Patch
     for pos in chosen_offsets:
         work_data[pos:pos + 4] = target_bytes
 
     console.print(
-        f"[bold green]✓ Patched Honor: {chosen_val:.0f} → {target_val} "
-        f"at {len(chosen_offsets)} location(s)[/bold green]"
+        f"[bold green]✓ Patched Honor: {chosen_val:.0f} → {target_val}[/bold green]"
     )
     return True
 
@@ -645,15 +655,16 @@ def edit_save_file(
     pure_stem = save_path.name.split('.')[0]
     bak_path = save_path.parent / (pure_stem + ".bak")
     
-    # Avoid shutil.copy2 warning if save_path is already .bak
-    if bak_path.resolve() != save_path.resolve():
+    # Preservation Policy: Only create backup if it doesn't already exist.
+    # This prevents subsequent edits from overwriting the original "pristine" save.
+    if not bak_path.exists():
         try:
             shutil.copy2(save_path, bak_path)
-            console.print(f"Backup refreshed: {bak_path.name}")
+            console.print(f"Created permanent pristine backup: {bak_path.name}")
         except OSError as e:
-            console.print(f"[yellow]Warning: could not refresh backup: {e}[/yellow]")
+            console.print(f"[yellow]Warning: could not create pristine backup: {e}[/yellow]")
     else:
-        console.print("[dim]Save file is already a .bak, skipping self-backup.[/dim]")
+        console.print(f"[dim]Pristine .bak already exists, skipping backup update.[/dim]")
 
 
 
@@ -666,11 +677,11 @@ def edit_save_file(
         console.print(f"[yellow]Warning: could not create clone: {e}[/yellow]")
 
 
-    # ── Read raw file ────────────────────────────────────────────────────
+
     with open(save_path, 'rb') as f:
         raw_data = f.read()
 
-    # ── Unwrap (XOR deobfuscation) ───────────────────────────────────────
+
     try:
         work_data, meta = handle_srdr_layers(raw_data, mode='decrypt')
         xor_key = meta['xor_key']
@@ -683,7 +694,7 @@ def edit_save_file(
         console.print(f"[red]Failed to unwrap save layers: {e}[/red]")
         return False
 
-    # ── Apply patches ────────────────────────────────────────────────────
+
     patched_any = False
     if money_amount is not None:
         if _patch_money(work_data, money_amount, current_money, force=force):
@@ -698,7 +709,7 @@ def edit_save_file(
         console.print("[yellow]No changes made to save file.[/yellow]")
         return False
 
-    # ── Re-wrap: JOAAT Checksum, XOR re-obfuscate and write back ──
+
     try:
         new_checksum = _sign_and_write(save_path, work_data, xor_key, header)
 
