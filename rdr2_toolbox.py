@@ -94,7 +94,7 @@ LML_URL = "https://www.rdr2mods.com/downloads/rdr2/tools/76-lennys-mod-loader-rd
 SKIP_INTRO_URL = "https://www.nexusmods.com/reddeadredemption2/mods/36"
 
 def set_simulation_mode(base_dir: Path):
-    global TOOLBOX_DIR, STAGING_DIR, BACKUP_DIR, MANIFEST_FILE
+    global TOOLBOX_DIR, STAGING_DIR, BACKUP_DIR, MANIFEST_FILE, PROFILES_DIR
     TOOLBOX_DIR   = base_dir
     STAGING_DIR   = TOOLBOX_DIR / "staging"
     BACKUP_DIR    = TOOLBOX_DIR / "backups"
@@ -148,7 +148,16 @@ def print_proton_setup(prefix: Optional[Path]):
     else:
         console.print("[red]Warning: Proton prefix (compatdata) not found![/red]")
     console.print("\nTo enable ASI Loaders (ScriptHookRDR2), add the following to RDR2's Steam Launch Options:")
-    console.print(Panel("WINEDLLOVERRIDES=\"dinput8,version,ScriptHookRDR2=n,b\" %command%", border_style="green"))
+    console.print(Panel(
+        "[bold cyan]Manual Setup Instructions:[/bold cyan]\n\n"
+        "1. Open Steam and right-click on Red Dead Redemption 2.\n"
+        "2. Select [bold]Properties[/bold] > [bold]General[/bold].\n"
+        "3. Paste the following into [bold]Launch Options[/bold]:\n\n"
+        "[bold green]WINEDLLOVERRIDES=\"dinput8=n,b;version=n,b;ScriptHookRDR2=n,b\" %command%[/bold green]\n\n"
+        "This ensures the game loads the required modding libraries.",
+        title="Proton Configuration",
+        border_style="green"
+    ))
 
 def load_manifest() -> Dict[str, Any]:
     if MANIFEST_FILE.exists():
@@ -239,7 +248,7 @@ def apply_wine_overrides(prefix_path: Optional[Path]):
         "dinput8": "native,builtin",
         "version": "native,builtin",
         "ScriptHookRDR2": "native,builtin",
-        "vulkan-1": "native,builtin"
+        # BUG-C02: vulkan-1 removed as it breaks DXVK/Proton
     }
     section_header = '[Software\\\\Wine\\\\DllOverrides]'
     try:
@@ -482,20 +491,29 @@ def install_lml(game_path: Path):
             console.print("[yellow]Then extract 'vfs.asi' and everything inside 'ModLoader' to your RDR2 folder.[/yellow]")
 
 def install_lml_from_path(extract_path: Path, game_path: Path):
-    # Pass 1: find and copy vfs.asi
+    """
+    Installs LML (vfs.asi and lml folder) safely (BUG-C03).
+    """
+    # Pass 1: find and copy vfs.asi + lml directory
     for f in extract_path.rglob("*"):
         if f.is_file() and f.name.lower() == "vfs.asi":
+            # Copy vfs.asi
             shutil.copy2(f, game_path / "vfs.asi")
-            if (f.parent / "lml").is_dir():
-                shutil.copytree(f.parent / "lml", game_path / "lml", dirs_exist_ok=True)
+            
+            # Determine lml source
+            lml_src = f.parent / "lml"
+            if lml_src.is_dir():
+                shutil.copytree(lml_src, game_path / "lml", dirs_exist_ok=True)
+                console.print(f"✓ Installed LML core directory to {game_path.name}/lml/")
+            else:
+                # BUG-C03 Fix: Create lml directory if it doesn't exist to prevent crash
+                (game_path / "lml").mkdir(exist_ok=True)
+                console.print(f"✓ Created missing lml core directory at {game_path.name}/lml/")
+            
+            console.print("✓ Installed vfs.asi to game root")
             break
-
-    # Pass 2: find and copy ModLoader contents
-    for root, _, files in os.walk(extract_path):
-        root_path = Path(root)
-        if root_path.name == "ModLoader":
-            shutil.copytree(root_path, game_path, dirs_exist_ok=True)
-            break
+    
+    # Pass 2: (Removed) Never copy ModLoader directory to game root as it is destructive.
 
 def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     mods_staging = STAGING_DIR / "mods"
@@ -527,8 +545,15 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     deployment_queue: Dict[str, Dict[str, Any]] = {}
     lml_installed = False
     requires_scripthook = False
-    for mod_name, data in sorted(modlist.items(), key=lambda x: x[1].get('priority', 50) if isinstance(x[1], dict) else 50):  # type: ignore
-        if not isinstance(data, dict) or not data.get("enabled", True):
+    # Sort mods by priority (BUG-A03: filter and safe sort)
+    try:
+        modlist_items = [(k, v) for k, v in modlist.items() if isinstance(v, dict)]
+        sorted_mods = sorted(modlist_items, key=lambda x: x[1].get('priority', 50))
+    except (AttributeError, KeyError, TypeError):
+        sorted_mods = sorted(modlist.items())
+    
+    for mod_name, data in sorted_mods:
+        if not data.get("enabled", True): # We already know data is a dict
             continue
         # Ensure name is string for junction
         name_str = str(mod_name)
@@ -669,10 +694,13 @@ def clean_purge():
                 console.print(f"[red]Failed to unlink {target_path}: {e}[/red]")
                 failed_entries.append(target_path_str)
         else:
-            if not target_path.exists():
-                console.print(f"[yellow]Skipping unlink: {target_path} not found.[/yellow]")
+            # BUG-MOD07: If file exists but is not a managed hardlink, keep in manifest
+            if target_path.exists():
+                console.print(f"[yellow]Skipping {target_path.name}: exists but owner unverified (keeping in manifest).[/yellow]")
+                failed_entries.append(target_path_str)
             else:
-                console.print(f"[yellow]Skipping {target_path.name}: not a managed hardlink.[/yellow]")
+                # File already gone, safe to drop from manifest
+                pass
 
     updated_manifest = {k: manifest[k] for k in failed_entries}
     save_manifest(updated_manifest)
@@ -822,9 +850,8 @@ def apply_deepsurface_fix(prefix_path: Optional[Path]):
         content = xml_path.read_bytes()
         encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
         text = content.decode(encoding)  # type: ignore
+        # BUG-A04: Redundant second call removed as patch_xml_tag is already case-insensitive
         new_text = patch_xml_tag(text, "deepsurfaceQuality", "kSettingLevel_Ultra")
-        if new_text == text:
-            new_text = patch_xml_tag(text, "DeepSurfaceQuality", "kSettingLevel_Ultra")
         if new_text != text:
             xml_path.write_bytes(new_text.encode(encoding))  # type: ignore
             console.print("[SUCCESS] DeepSurfaceQuality set to Ultra.", style="bold green")
@@ -1033,6 +1060,8 @@ def install_local_mod_zip(zip_path: str, game_path: Path, prefix_path: Optional[
         if has_asi:
              for asi in asis:
                  try:
+                     # BUG-A05: Only skip if explicitly inside an "lml" subdirectory
+                     # This preserves context if the .asi is in a generic subfolder
                      asi.relative_to(tmp_path / "lml")
                  except ValueError:
                      shutil.copy2(asi, staging_mod_dir)

@@ -46,32 +46,37 @@ def setup_mock_environment():
     save_file = save_dir / "SRDR30015"
     
     if not save_file.exists():
-        console.print("[info]Initializing Mock Save File...[/info]")
-        with open(save_file, "wb") as f:
-            # Structurally valid SRDR header (260 bytes)
-            # Magic (0x00000004) + UTF-16LE placeholder text + padding
-            header = bytearray(0x104)
-            # RDR2 saves start with 0x04 0x00 0x00 0x00 (Version 4)
-            struct.pack_into("<I", header, 0, 4)
-            desc = "Chapter 2 - 12.5%".encode("utf-16-le")
-            for i, b in enumerate(desc):
-                header[4+i] = b
-            f.write(header)
-            
-            # Zeroed payload (0x2000 - 0x104 bytes)
-            # Note: real saves are XORed. This mock is plain for easier patching in preview.
-            f.write(b"\x00" * (0x2000 - 0x104))
-            
-            # Injecting test values at aligned offsets
-            f.seek(0x400)
-            f.write(b"\x13\x00\xD4\x00") # Pattern for money $432.18
-            f.write(struct.pack("<i", 43218)) 
-            
-            f.seek(0x800)
-            f.write(struct.pack("<i", 150)) # BUG-N08: honor is int32
+        console.print("[info]Initializing Mock Save File (XOR-obfuscated)...[/info]")
+        from save_modifier import _xor_deobfuscate, _KNOWN_XOR_KEY, _HEADER_LEN
         
-        # BUG-N02: Do NOT call sign on a plain-text mock (corrupts end of file)
-        # rdr2_toolbox.validate_and_sign_srdr(save_file)
+        # 1. Create plain Header (260 bytes)
+        header = bytearray(_HEADER_LEN)
+        struct.pack_into("<I", header, 0, 4) # Magic LE 4
+        desc = "Chapter 2 - 12.5%".encode("utf-16-le")
+        for i, b in enumerate(desc):
+            if i < _HEADER_LEN - 4:
+                header[4+i] = b
+        
+        # 2. Create plain Payload
+        payload_size = 0x2000 - _HEADER_LEN
+        plain_payload = bytearray(payload_size)
+        
+        # Inject test values into plain payload
+        # Offset 0x400 in file is 0x400 - 0x104 = 0x2fc in payload
+        money_pos = 0x400 - _HEADER_LEN
+        plain_payload[money_pos : money_pos+4] = b"\x13\x00\xD4\x00" # Money pattern
+        struct.pack_into("<i", plain_payload, money_pos + 4, 43218) # $432.18
+        
+        honor_pos = 0x800 - _HEADER_LEN
+        struct.pack_into("<i", plain_payload, honor_pos, 150) # Honor 150
+        
+        # 3. XOR-obfuscate the payload
+        xored_payload = _xor_deobfuscate(bytes(plain_payload), _KNOWN_XOR_KEY)
+        
+        # 4. Write full file
+        with open(save_file, "wb") as f:
+            f.write(header)
+            f.write(xored_payload)
 
     rdr2_toolbox.set_simulation_mode(SIM_ROOT)
 

@@ -98,13 +98,20 @@ def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
     # BUG-09: Verify alignment on key_len boundaries
     total_blocks = len(payload) // key_len
     count = 0
+    # BUG-MOD06: Use a more robust threshold (0.5%) and verify with null ratio
+    KNOWN_KEY_THRESHOLD = 0.005
+    
     for block_idx in range(total_blocks):
         start = block_idx * key_len
         if payload[start:start + key_len] == _KNOWN_XOR_KEY:
             count += 1
     
-    if count >= total_blocks * 0.01:
-        return _KNOWN_XOR_KEY
+    if count >= total_blocks * KNOWN_KEY_THRESHOLD:
+        # Double-check with null ratio for robustness on dense saves
+        test_plain = _xor_deobfuscate(payload[:4096], _KNOWN_XOR_KEY)
+        null_ratio = sum(1 for b in test_plain if b == 0) / len(test_plain)
+        if null_ratio >= 0.25:
+            return _KNOWN_XOR_KEY
 
 
     # Slow path: byte-frequency analysis
@@ -160,17 +167,19 @@ def _sign_and_write(save_path: Path, work_data: bytearray, xor_key: bytes, heade
     """
     Centralized logic to sign, re-obfuscate and write an SRDR file.
     Returns the new checksum value.
+    Note: copies work_data to avoid in-place mutation (BUG-V4-03).
     """
+    signed_data = bytearray(work_data)
     # 1. Recalculate JOAAT checksum on the modified deobfuscated payload (excluding the last 4 bytes)
-    payload_data = bytes(work_data[:-4])
+    payload_data = bytes(signed_data[:-4])
     new_checksum = joaat(payload_data)
     checksum_bytes = struct.pack("<I", new_checksum)
     
     # 2. Append/replace the new checksum at the end of the deobfuscated payload
-    work_data[-4:] = checksum_bytes
+    signed_data[-4:] = checksum_bytes
 
     # 3. Re-obfuscate with the same key (XOR is symmetric)
-    re_obfuscated = _xor_deobfuscate(bytes(work_data), xor_key)
+    re_obfuscated = _xor_deobfuscate(bytes(signed_data), xor_key)
 
     # 4. Rebuild file: original header (untouched) + re-obfuscated payload
     final_data = header + bytes(re_obfuscated)
@@ -402,21 +411,20 @@ def _scan_int32_positions(
 ) -> Dict[int, List[int]]:
     """
     Scans data for int32 values in [low, high].
-    Uses unaligned sliding window as RDR2 fields are not always 4-byte aligned.
-    Returns {value: [list_of_offsets]}.
+    Uses unaligned sliding window. Optimized with memoryview (BUG-M04).
     """
     result: Dict[int, List[int]] = {}
-    # Optimization: if the range is small, find() is faster.
-    # But for broad ranges, we iterate.
-    # To avoid excessive slowness, we'll use a memoryview and struct on chunks
-    # or just a simple range-based unpacking.
-    for i in range(len(data) - 3):
+    mv = memoryview(data).cast('B')
+    n = len(data) - 3
+    fmt = '<i'
+    unpack_from = struct.unpack_from
+    for i in range(n):
         try:
-            val = struct.unpack_from('<i', data, i)[0]
+            val = unpack_from(fmt, mv, i)[0]
             if low <= val <= high:
                 result.setdefault(val, []).append(i)
         except (struct.error, IndexError):
-            break
+            continue # BUG-V4-01: continue instead of break
     return result
 
 
@@ -425,18 +433,21 @@ def _scan_float32_positions(
 ) -> Dict[float, List[int]]:
     """
     Scans data for float32 values in [low, high].
-    Uses unaligned sliding window as RDR2 fields are not always 4-byte aligned.
-    Returns {display_value_rounded: [list_of_offsets]}.
+    Uses unaligned sliding window. Optimized with memoryview (BUG-M04).
     """
     result: Dict[float, List[int]] = {}
-    for i in range(len(data) - 3):
+    mv = memoryview(data).cast('B')
+    n = len(data) - 3
+    fmt = '<f'
+    unpack_from = struct.unpack_from
+    for i in range(n):
         try:
-            val = struct.unpack_from('<f', data, i)[0]
+            val = unpack_from(fmt, mv, i)[0]
             if val == val and low <= val <= high:  # NaN check
                 rounded = round(float(val), 2)
                 result.setdefault(rounded, []).append(i)
         except (struct.error, IndexError):
-            break
+            continue # BUG-V4-01: continue instead of break
     return result
 
 
@@ -585,11 +596,11 @@ def _patch_honor(
     # Scan for int32 values in a reasonable honor range
     int_positions = _scan_int32_positions(work_data, HONOR_MIN - 10, HONOR_MAX + 10)
 
-    # Filter out noise (BUG-10: resserrer le filtre)
+    # Filter out noise (BUG-A02: slightly relax the filter for common 0 values)
     filtered: List[Tuple[float, int, List[int]]] = []
     for val, offsets in int_positions.items():
-        # Honor is usually unique or appears in very few places
-        if len(offsets) > 20: 
+        # Only ignore extremely common values (likely junk/padding)
+        if len(offsets) > 50: 
             continue
         filtered.append((float(val), len(offsets), offsets))
 
@@ -597,7 +608,8 @@ def _patch_honor(
     if current_honor is not None:
         filtered.sort(key=lambda x: (abs(x[0] - current_honor), -x[1]))
     else:
-        # Default to fewer occurrences (more likely to be a single stat)
+        # BUG-A02: Be less aggressive with filtering occurrences.
+        # Common values (0, 320) might appear fairly often.
         filtered.sort(key=lambda x: x[1])
 
     if not filtered:
@@ -674,9 +686,12 @@ def edit_save_file(
     if _is_rdr2_running():
         console.print("[bold red]⚠ Red Dead Redemption 2 is currently running.[/bold red]")
         console.print("[yellow]Modifying saves while the game is open can lead to data loss or corruption.[/yellow]")
-        confirm = Prompt.ask("Proceed anyway? (y/N)", default="n")
-        if confirm.lower() != "y":
-            return False
+        if force:
+            console.print("[yellow]Force mode: proceeding despite running game.[/yellow]")
+        else:
+            confirm = Prompt.ask("Proceed anyway? (y/N)", default="n")
+            if confirm.lower() != "y":
+                return False
 
     console.print(f"\n[cyan]Editing Save File: {save_path.name}[/cyan]")
 
