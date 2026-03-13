@@ -45,10 +45,6 @@ console = Console()
 BACKUP_SCHEMA_VERSION = "1.1"
 BACKUP_EXTENSION      = ".rdr2cfg"
 
-# ---------------------------------------------------------------------------
-# Photo Mode Exporter
-# ---------------------------------------------------------------------------
-
 def export_photo_mode_images(prefix_path: Path, output_dir: Path) -> int:
     """
     Scans Rockstar Profiles for PRDR* photo files and exports them as JPEGs.
@@ -78,10 +74,6 @@ def export_photo_mode_images(prefix_path: Path, output_dir: Path) -> int:
     
     return exported_count
 
-# ---------------------------------------------------------------------------
-# Stutter Fix Utility
-# ---------------------------------------------------------------------------
-
 def clear_graphics_cache(prefix_path: Path) -> int:
     """
     Deletes RDR2 graphics cache files (sga_* and pipelinestate.cache) to fix stutters.
@@ -106,10 +98,6 @@ def clear_graphics_cache(prefix_path: Path) -> int:
             console.print(f"[yellow]Failed to delete {target.name}: {e}[/yellow]")
 
     return cleared_count
-
-# ---------------------------------------------------------------------------
-# Launcher Maintenance
-# ---------------------------------------------------------------------------
 
 def clear_launcher_cache(prefix_path: Path) -> int:
     """
@@ -146,10 +134,6 @@ def clear_launcher_cache(prefix_path: Path) -> int:
                     console.print(f"[yellow]Failed to clear launcher cache at {cache.name}: {e}[/yellow]")
                     
     return cleared_count
-
-# ---------------------------------------------------------------------------
-# Mod configuration discovery (Staged mods)
-# ---------------------------------------------------------------------------
 
 def _crc32_file(path: Path) -> str:
     """CRC32 of a file as zero-padded 8-char hex. Fast enough for large mod files."""
@@ -417,10 +401,6 @@ def list_backups(backup_dir: Path) -> List[Dict]:
     entries.sort(key=lambda e: e["created_at"], reverse=True)
     return entries
 
-
-# =============================================================================
-# Steam / installation discovery
-# =============================================================================
 
 def get_steam_root() -> Optional[Path]:
     candidates = [

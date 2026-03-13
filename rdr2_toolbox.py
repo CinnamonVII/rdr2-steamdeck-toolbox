@@ -119,18 +119,11 @@ def manual_fallback_prompt() -> Tuple[Optional[Path], Optional[Path]]:
     if "common" in game_path.parts:
         try:
             parts_list = list(game_path.parts)
-            # Find index safely
-            idx = -1
-            for i, p in enumerate(parts_list):
-                if p == "common":
-                    idx = i
-                    break
             if idx != -1:
-                # Reconstruct path safely without slicing if linter is confused
-                base_path = Path("/")
+                candidate_prefix = Path("/")
                 for i in range(idx):
-                    base_path = base_path / parts_list[i]
-                candidate_prefix = base_path / "compatdata" / APP_ID / "pfx"
+                    candidate_prefix = candidate_prefix / parts_list[i]
+                candidate_prefix = candidate_prefix / "compatdata" / APP_ID / "pfx"
                 if candidate_prefix.exists():
                     prefix_path = candidate_prefix
         except Exception:
@@ -248,7 +241,6 @@ def apply_wine_overrides(prefix_path: Optional[Path]):
         "dinput8": "native,builtin",
         "version": "native,builtin",
         "ScriptHookRDR2": "native,builtin",
-        # BUG-C02: vulkan-1 removed as it breaks DXVK/Proton
     }
     section_header = '[Software\\\\Wine\\\\DllOverrides]'
     try:
@@ -492,28 +484,22 @@ def install_lml(game_path: Path):
 
 def install_lml_from_path(extract_path: Path, game_path: Path):
     """
-    Installs LML (vfs.asi and lml folder) safely (BUG-C03).
+    Installs LML (vfs.asi and lml folder) safely.
     """
-    # Pass 1: find and copy vfs.asi + lml directory
     for f in extract_path.rglob("*"):
         if f.is_file() and f.name.lower() == "vfs.asi":
-            # Copy vfs.asi
             shutil.copy2(f, game_path / "vfs.asi")
             
-            # Determine lml source
             lml_src = f.parent / "lml"
             if lml_src.is_dir():
                 shutil.copytree(lml_src, game_path / "lml", dirs_exist_ok=True)
                 console.print(f"✓ Installed LML core directory to {game_path.name}/lml/")
             else:
-                # BUG-C03 Fix: Create lml directory if it doesn't exist to prevent crash
                 (game_path / "lml").mkdir(exist_ok=True)
                 console.print(f"✓ Created missing lml core directory at {game_path.name}/lml/")
             
             console.print("✓ Installed vfs.asi to game root")
             break
-    
-    # Pass 2: (Removed) Never copy ModLoader directory to game root as it is destructive.
 
 def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     mods_staging = STAGING_DIR / "mods"
@@ -545,7 +531,6 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
     deployment_queue: Dict[str, Dict[str, Any]] = {}
     lml_installed = False
     requires_scripthook = False
-    # Sort mods by priority (BUG-A03: filter and safe sort)
     try:
         modlist_items = [(k, v) for k, v in modlist.items() if isinstance(v, dict)]
         sorted_mods = sorted(modlist_items, key=lambda x: x[1].get('priority', 50))
@@ -553,9 +538,8 @@ def deploy_mods(game_path: Path, prefix_path: Optional[Path] = None):
         sorted_mods = sorted(modlist.items())
     
     for mod_name, data in sorted_mods:
-        if not data.get("enabled", True): # We already know data is a dict
+        if not data.get("enabled", True):
             continue
-        # Ensure name is string for junction
         name_str = str(mod_name)
         mod_dir = Path(mods_staging) / name_str
         if not mod_dir.exists():
@@ -694,13 +678,9 @@ def clean_purge():
                 console.print(f"[red]Failed to unlink {target_path}: {e}[/red]")
                 failed_entries.append(target_path_str)
         else:
-            # BUG-MOD07: If file exists but is not a managed hardlink, keep in manifest
             if target_path.exists():
                 console.print(f"[yellow]Skipping {target_path.name}: exists but owner unverified (keeping in manifest).[/yellow]")
                 failed_entries.append(target_path_str)
-            else:
-                # File already gone, safe to drop from manifest
-                pass
 
     updated_manifest = {k: manifest[k] for k in failed_entries}
     save_manifest(updated_manifest)
@@ -709,11 +689,6 @@ def clean_purge():
         console.print(f"[SUCCESS] Purged {removed_count} modded files. Directory restored vanilla.", style="bold green")
     else:
         console.print(f"[WARNING] Purged {removed_count} files, but {len(failed_entries)} failed. Review manifest.", style="bold yellow")
-
-
-# ---------------------------------------------------------------------------
-# Maintenance helpers
-# ---------------------------------------------------------------------------
 
 def fix_sh_black_screen(game_path: Path):
     ini_path = game_path / "ScriptHookConfig.ini"
@@ -791,11 +766,6 @@ def set_adapter_index(prefix_path: Optional[Path]):
                  console.print("[info]Adapter Index is already 0.", style="bold green")
     except Exception as e:
         console.print(f"[red]Failed to patch system.xml: {e}[/red]")
-
-# ---------------------------------------------------------------------------
-# Maintenance Helpers
-# ---------------------------------------------------------------------------
-
 def cleanup_all_backups(game_path: Optional[Path], prefix_path: Optional[Path]):
     """Purges .bak and _CLONED_ save files from the prefix."""
     if not prefix_path:
@@ -850,7 +820,6 @@ def apply_deepsurface_fix(prefix_path: Optional[Path]):
         content = xml_path.read_bytes()
         encoding = 'utf-16' if content[:2] in (b'\xff\xfe', b'\xfe\xff') else 'utf-8'  # type: ignore
         text = content.decode(encoding)  # type: ignore
-        # BUG-A04: Redundant second call removed as patch_xml_tag is already case-insensitive
         new_text = patch_xml_tag(text, "deepsurfaceQuality", "kSettingLevel_Ultra")
         if new_text != text:
             xml_path.write_bytes(new_text.encode(encoding))  # type: ignore
@@ -1060,9 +1029,8 @@ def install_local_mod_zip(zip_path: str, game_path: Path, prefix_path: Optional[
         if has_asi:
              for asi in asis:
                  try:
-                     # BUG-A05: Only skip if explicitly inside an "lml" subdirectory
-                     # This preserves context if the .asi is in a generic subfolder
-                     asi.relative_to(tmp_path / "lml")
+                     if "lml" in Path(file_path).parts:
+                         asi.relative_to(tmp_path / "lml")
                  except ValueError:
                      shutil.copy2(asi, staging_mod_dir)
              console.print(f"[info]Detected {len(asis)} .asi file(s). Copied to staging.[/info]")
@@ -1088,11 +1056,6 @@ def install_local_mod_zip(zip_path: str, game_path: Path, prefix_path: Optional[
             
         console.print(f"[bold green]Successfully installed {zip_path_name}![/bold green]")
         return True
-
-
-# ---------------------------------------------------------------------------
-# Nexus integration
-# ---------------------------------------------------------------------------
 
 class NexusManager:
     def __init__(self, api_key: Optional[str] = None):
@@ -1376,11 +1339,6 @@ def handle_mod_manager(game_path: Optional[Path], prefix_path: Optional[Path]):
                     console.print("[cyan]Re-deploying mods to apply changes...[/cyan]")
                     clean_purge()
                     deploy_mods(game_path, prefix_path)  # type: ignore  # type: ignore
-
-
-# ---------------------------------------------------------------------------
-# Backup & Restore manager
-# ---------------------------------------------------------------------------
 
 def _print_backup_table(backups: List[Dict]):
     """Renders a Rich table of available .rdr2cfg snapshots."""

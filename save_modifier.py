@@ -57,16 +57,11 @@ except ImportError:
 
 console = Console()
 
-# ---------------------------------------------------------------------------
 # Constants
-# ---------------------------------------------------------------------------
 
 # SRDR header
-_SRDR_MAGIC        = b'\x04\x00\x00\x00'   # uint32 LE = 4 (BUG-N04)
-_HEADER_LEN        = 0x104                  # 260 bytes (confirmed by rdr2view)
-# Note: there is NO checksum field in the SRDR header.
-# Offset 0x04 onward is UTF-16LE description text (chapter, completion%, timestamp).
-# The header is: 4 bytes magic + UTF-16LE text + null padding to 260 bytes.
+_SRDR_MAGIC        = b'\x04\x00\x00\x00'
+_HEADER_LEN        = 0x104
 
 # Max plausible money in cents (INT32_MAX)
 _MAX_CENTS = 2_147_483_647
@@ -95,10 +90,8 @@ def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
         raise RuntimeError("Payload too small to extract XOR key")
 
     # Fast path: check if the known key works
-    # BUG-09: Verify alignment on key_len boundaries
     total_blocks = len(payload) // key_len
     count = 0
-    # BUG-MOD06: Use a more robust threshold (0.5%) and verify with null ratio
     KNOWN_KEY_THRESHOLD = 0.005
     
     for block_idx in range(total_blocks):
@@ -124,7 +117,6 @@ def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
         key_bytes[pos] = counts.index(max(counts))
 
     key = bytes(key_bytes)
-    # Verify extracted key (BUG-N03: fix alignment)
     count = 0
     for block_idx in range(total_blocks):
         start = block_idx * key_len
@@ -151,23 +143,18 @@ def _xor_deobfuscate(payload: bytes, key: bytes) -> bytearray:
     remainder = payload_len % key_len
     expanded_key = key * full_reps + key[:remainder]  # type: ignore
     
-    # Single XOR on the entire data as big integers
     payload_int = int.from_bytes(payload, 'big')
     key_int = int.from_bytes(expanded_key, 'big')
-    result_int = payload_int ^ key_int  # type: ignore
+    result_int = payload_int ^ key_int
     
     return bytearray(result_int.to_bytes(payload_len, 'big'))
 
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  2.  Checksum & Signing (BUG-N07)                                         ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
 
 def _sign_and_write(save_path: Path, work_data: bytearray, xor_key: bytes, header: bytes) -> int:
     """
     Centralized logic to sign, re-obfuscate and write an SRDR file.
     Returns the new checksum value.
-    Note: copies work_data to avoid in-place mutation (BUG-V4-03).
+    Note: copies work_data to avoid in-place mutation.
     """
     signed_data = bytearray(work_data)
     # 1. Recalculate JOAAT checksum on the modified deobfuscated payload (excluding the last 4 bytes)
@@ -178,10 +165,7 @@ def _sign_and_write(save_path: Path, work_data: bytearray, xor_key: bytes, heade
     # 2. Append/replace the new checksum at the end of the deobfuscated payload
     signed_data[-4:] = checksum_bytes
 
-    # 3. Re-obfuscate with the same key (XOR is symmetric)
     re_obfuscated = _xor_deobfuscate(bytes(signed_data), xor_key)
-
-    # 4. Rebuild file: original header (untouched) + re-obfuscated payload
     final_data = header + bytes(re_obfuscated)
 
     with open(save_path, 'wb') as f:
@@ -213,10 +197,6 @@ def joaat(data: bytes) -> int:
 
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  2.  Header Validation (no checksum in SRDR format)                      ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
 def validate_and_sign_srdr(file_path: Path) -> bool:
     """
     Validates a modified SRDR save file by recalculating its JOAAT signature.
@@ -237,10 +217,6 @@ def validate_and_sign_srdr(file_path: Path) -> bool:
         return False
 
 
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  3.  Layer Handling (unwrap / rewrap)                                    ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
 
 def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, Dict]:
     """
@@ -265,10 +241,7 @@ def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, D
     # Extract the XOR key from the payload
     xor_key = _extract_xor_key(payload)
 
-    # Deobfuscate
     plaintext = _xor_deobfuscate(payload, xor_key)
-
-    # Verify: deobfuscated data should have high null-byte ratio
     null_sample = sum(1 for b in plaintext[:4096] if b == 0)  # type: ignore
     null_ratio = null_sample / min(4096, len(plaintext))
     if null_ratio < 0.3:
@@ -287,10 +260,6 @@ def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, D
 
     return plaintext, metadata
 
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  4.  File System Helpers                                                 ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
 
 def _slot_label(filename: str) -> str:
     """Returns a human-readable label for an SRDR filename."""
@@ -389,10 +358,6 @@ def select_save_file(prefix_path: Optional[Path]) -> Optional[Path]:
     return selected["path"]
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  5.  In-Memory Patching (fuzzy-range scan)                               ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
 def _find_all_occurrences(data: bytearray, pattern: bytes) -> List[int]:
     """Finds all occurrences of pattern in data."""
     positions = []
@@ -411,7 +376,7 @@ def _scan_int32_positions(
 ) -> Dict[int, List[int]]:
     """
     Scans data for int32 values in [low, high].
-    Uses unaligned sliding window. Optimized with memoryview (BUG-M04).
+    Uses unaligned sliding window.
     """
     result: Dict[int, List[int]] = {}
     mv = memoryview(data).cast('B')
@@ -424,7 +389,7 @@ def _scan_int32_positions(
             if low <= val <= high:
                 result.setdefault(val, []).append(i)
         except (struct.error, IndexError):
-            continue # BUG-V4-01: continue instead of break
+            continue
     return result
 
 
@@ -433,7 +398,7 @@ def _scan_float32_positions(
 ) -> Dict[float, List[int]]:
     """
     Scans data for float32 values in [low, high].
-    Uses unaligned sliding window. Optimized with memoryview (BUG-M04).
+    Uses unaligned sliding window.
     """
     result: Dict[float, List[int]] = {}
     mv = memoryview(data).cast('B')
@@ -447,7 +412,7 @@ def _scan_float32_positions(
                 rounded = round(float(val), 2)
                 result.setdefault(rounded, []).append(i)
         except (struct.error, IndexError):
-            continue # BUG-V4-01: continue instead of break
+            continue
     return result
 
 
@@ -480,7 +445,6 @@ def _patch_money(
 ) -> bool:
     """
     Patches money in the deobfuscated save data using fuzzy-range scanning.
-    Money is stored as int32 centimes (BUG-02, 03).
     """
 
     target_cents = int(round(money_amount * 100))
@@ -489,9 +453,6 @@ def _patch_money(
             f"[red]Money value ${money_amount:.2f} is out of range. "
             f"Maximum is ${_MAX_CENTS / 100:.2f}.[/red]"
         )
-        return False  # BUG-07: Fix missing return
-
-    # ── Strategy 1: fuzzy-range scan ─────────────────────────────────
     if current_money:
         # User gave a hint — scan ±50% around it
         approx_cents = int(round(current_money * 100))
@@ -506,7 +467,7 @@ def _patch_money(
             "[cyan]No current money hint — broad-scanning all plausible "
             "money values ($0.01–$100,000)...[/cyan]"
         )
-        low_cents = 1 # BUG-N06: scan from 1 cent
+        low_cents = 1
         high_cents = _PLAUSIBLE_MONEY_MAX
 
 
@@ -517,9 +478,6 @@ def _patch_money(
     for cents_val, offsets in int_positions.items():
         all_candidates.append((cents_val / 100.0, len(offsets), offsets))
 
-    # BUG-02 Refinement: prioritize proximity to hint if provided
-    if current_money is not None:
-        all_candidates.sort(key=lambda x: (abs(x[0] - current_money), -x[1]))
     else:
         all_candidates.sort(key=lambda x: -x[1])
 
@@ -528,8 +486,6 @@ def _patch_money(
             f"[yellow]No plausible money matches found (int32 cents). Cannot patch money.[/yellow]"
         )
         return False
-
-    # BUG-04 & BUG-N05: candidate selection
     if force:
         # Auto-pick the first one (usually the closest match due to sorting)
         chosen_display, chosen_count, chosen_offsets = all_candidates[0]
@@ -544,7 +500,6 @@ def _patch_money(
         idx = _prompt_candidate_choice("Money candidates found", lines, shown)
         chosen_display, chosen_count, chosen_offsets = all_candidates[idx]
 
-    # BUG-04: Prevent blind patching of all occurrences if risky
     if chosen_count > 10 and not force:
         console.print(f"[yellow]Warning: {chosen_count} hits for this value. "
                       "Patching all might corrupt unrelated data.[/yellow]")
@@ -552,11 +507,9 @@ def _patch_money(
         if confirm.lower() != "y":
             chosen_offsets = chosen_offsets[:1]
     elif chosen_count > 10 and force:
-        # In force mode, we just patch the first one to be safe if too many hits
         console.print(f"[yellow]Auto-patching: too many hits ({chosen_count}), limiting to first occurrence.[/yellow]")
         chosen_offsets = chosen_offsets[:1]
-
-    new_bytes = struct.pack('<i', target_cents) # BUG-03: Write as int32
+    new_bytes = struct.pack('<i', target_cents)
 
 
     for pos in chosen_offsets:
@@ -576,11 +529,10 @@ def _patch_honor(
     work_data: bytearray,
     honor_choice: str,
     current_honor: Optional[float],
-    force: bool = False, # BUG-N05: non-interactive mode
+    force: bool = False,
 ) -> bool:
     """
     Patches honor in the deobfuscated save data.
-    Honor is stored as a signed int32 (BUG-06, 10).
     Typical range is ±320 or similar internally.
     """
 
@@ -596,21 +548,17 @@ def _patch_honor(
     # Scan for int32 values in a reasonable honor range
     int_positions = _scan_int32_positions(work_data, HONOR_MIN - 10, HONOR_MAX + 10)
 
-    # Filter out noise (BUG-A02: slightly relax the filter for common 0 values)
-    filtered: List[Tuple[float, int, List[int]]] = []
     for val, offsets in int_positions.items():
-        # Only ignore extremely common values (likely junk/padding)
         if len(offsets) > 50: 
             continue
         filtered.append((float(val), len(offsets), offsets))
 
-    # Sort by proximity to user hint if available
-    if current_honor is not None:
-        filtered.sort(key=lambda x: (abs(x[0] - current_honor), -x[1]))
     else:
-        # BUG-A02: Be less aggressive with filtering occurrences.
-        # Common values (0, 320) might appear fairly often.
-        filtered.sort(key=lambda x: x[1])
+        # Sort by proximity to user hint if available
+        if current_honor is not None:
+            filtered.sort(key=lambda x: (abs(x[0] - current_honor), -x[1]))
+        else:
+            filtered.sort(key=lambda x: x[1])
 
     if not filtered:
         console.print(
@@ -618,7 +566,6 @@ def _patch_honor(
         )
         return False
 
-    # BUG-N05: candidate selection
     if force:
         chosen_val, chosen_count, chosen_offsets = filtered[0]
         console.print(f"[cyan]Force-selected candidate #1: {chosen_val:.0f}[/cyan]")
@@ -633,7 +580,6 @@ def _patch_honor(
         chosen_val, chosen_count, chosen_offsets = filtered[idx]
 
 
-    # BUG-04: safety check
     if chosen_count > 5 and not force:
         console.print(f"[yellow]Warning: {chosen_count} hits for honor. Risk of corruption.[/yellow]")
         confirm = Prompt.ask("Patch all occurrences? (y/N)", default="n")
@@ -656,10 +602,6 @@ def _patch_honor(
 
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  6.  Main Edit Pipeline                                                  ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
 def _is_rdr2_running() -> bool:
     """Checks if RDR2.exe is currently running (Steam Deck / Linux)."""
     try:
@@ -676,11 +618,10 @@ def edit_save_file(
     honor_choice: Optional[str] = None,
     current_money: Optional[float] = None,
     current_honor: Optional[float] = None,
-    force: bool = False, # Pass through for non-interactive
+    force: bool = False,
 ) -> bool:
     """
-    Edits an SRDR save file: deobfuscates, patches money/honor,
-    re-obfuscates, updates checksum, writes back.
+    Edits an SRDR save file.
     """
 
     if _is_rdr2_running():
@@ -695,16 +636,12 @@ def edit_save_file(
 
     console.print(f"\n[cyan]Editing Save File: {save_path.name}[/cyan]")
 
-    # ── Backup management (BUG-08: rotate oldest first) ──────────────────
     existing_clones = sorted(save_path.parent.glob(f"{save_path.stem}_CLONED_*"))
     while len(existing_clones) >= 3:
         try:
-            # BUG-08: pop(0) to remove the oldest instead of pop(-1)
             existing_clones.pop(0).unlink(missing_ok=True)
         except OSError:
             break
-
-    # BUG-N10: improve bak path logic
     pure_stem = save_path.name.split('.')[0]
     bak_path = save_path.parent / (pure_stem + ".bak")
     
@@ -720,7 +657,6 @@ def edit_save_file(
 
 
 
-    # BUG-12: Add microseconds to avoid collision on FAT32 (2s resolution)
     clone_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     clone_path = save_path.parent / f"{save_path.stem}_CLONED_{clone_ts}"
     try:
@@ -762,7 +698,7 @@ def edit_save_file(
         console.print("[yellow]No changes made to save file.[/yellow]")
         return False
 
-    # ── Re-wrap: JOAAT Checksum, XOR re-obfuscate and write back (BUG-N07) ──
+    # ── Re-wrap: JOAAT Checksum, XOR re-obfuscate and write back ──
     try:
         new_checksum = _sign_and_write(save_path, work_data, xor_key, header)
 
@@ -784,11 +720,7 @@ def edit_save_file(
         return False
 
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  7.  UI / Prompts                                                        ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
-
-def _prompt_save_edits() -> Tuple[Optional[float], Optional[str], Optional[float], Optional[float]]:
+def _prompt_save_edits():
     money_input = Prompt.ask(
         "Enter Target Money Amount (e.g. 5000), or leave empty to skip",
         default="",
@@ -907,10 +839,6 @@ def farm_honor(prefix_path: Path):
             "(see details above). Binary state unchanged.[/bold yellow]"
         )
 
-
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  8.  Save Snapshot Manager                                               ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
 
 def create_save_snapshot(prefix_path: Path, backup_dir: Path):
     """Creates a timestamped ZIP snapshot of the entire RDR2 Profiles directory."""
