@@ -30,3 +30,22 @@ Contributions are welcome! If you have ideas for the save editing algorithm or w
 # Current known bugs
 - The save modifier corrupts the file
 - Help me find the rest!
+
+# Linux & Proton Stability Tweaks
+These fixes were added to solve common issues when running RDR2 on the Steam Deck and generic Linux distros:
+- **DLL Overrides**: Automatic injection of `dinput8`, `version`, and `ScriptHookRDR2` overrides into the Proton `user.reg`.
+- **Launcher Fixes**: Automatically sets the Proton OS version to Windows 10 to resolve Rockstar Launcher errors.
+- **Graphics Optimization**: Toggle Vulkan API and set correct GPU adapter indices directly in `system.xml`.
+- **Black Screen Prevention**: Patches ScriptHook configuration to prevent UI-related black screens.
+
+# Steam Setup
+To enable mod loading, add this to RDR2's **Launch Options** in Steam:
+```bash
+WINEDLLOVERRIDES="dinput8=n,b;version=n,b;ScriptHookRDR2=n,b" %command%
+```
+
+# Safe Save Modifying
+The tool now handles the complex SRDR save format:
+- **Verified Signatures**: Automatically recalculates JOAAT checksums so your saves don't corrupt.
+- **XOR Deobfuscation**: Handles the 16-byte XOR layer used in RDR2 PC saves.
+- **Auto-Snapshots**: Creates `_CLONED_` backups before every edit for safety.
