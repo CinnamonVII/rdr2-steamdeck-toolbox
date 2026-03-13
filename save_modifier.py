@@ -62,7 +62,7 @@ console = Console()
 # ---------------------------------------------------------------------------
 
 # SRDR header
-_SRDR_MAGIC        = b'\x00\x00\x00\x04'   # Format version 4
+_SRDR_MAGIC        = b'\x04\x00\x00\x00'   # uint32 LE = 4 (BUG-N04)
 _HEADER_LEN        = 0x104                  # 260 bytes (confirmed by rdr2view)
 # Note: there is NO checksum field in the SRDR header.
 # Offset 0x04 onward is UTF-16LE description text (chapter, completion%, timestamp).
@@ -114,23 +114,20 @@ def _extract_xor_key(payload: bytes, key_len: int = 16) -> bytes:
         counts = [0] * 256
         for i in range(pos, len(payload), key_len):
             counts[payload[i]] += 1
-        key_bytes[pos] = counts.index(max(counts))  # type: ignore
+        key_bytes[pos] = counts.index(max(counts))
 
     key = bytes(key_bytes)
-    # Verify extracted key
+    # Verify extracted key (BUG-N03: fix alignment)
     count = 0
-    idx = 0
-    while True:
-        pos = payload.find(key, idx)
-        if pos == -1:
-            break
-        count += 1
-        idx = pos + key_len  # type: ignore
+    for block_idx in range(total_blocks):
+        start = block_idx * key_len
+        if payload[start:start + key_len] == key:
+            count += 1
     
     if count < total_blocks * 0.01:
         raise RuntimeError(
             f"XOR key extraction uncertain: key appears "
-            f"only {count}/{total_blocks} times"
+            f"only {count}/{total_blocks} aligned blocks"
         )
 
     return key
@@ -155,13 +152,33 @@ def _xor_deobfuscate(payload: bytes, key: bytes) -> bytearray:
     return bytearray(result_int.to_bytes(payload_len, 'big'))
 
 
-# Keep old name as alias for compatibility
-def xor_data(data: bytes, key: bytes, start_offset: int = 0) -> bytearray:
-    """Applies XOR cycle to data using a key with an optional periodicity shift."""
-    res = bytearray(data)
-    for i in range(len(res)):
-        res[i] ^= key[(i + start_offset) % len(key)]
-    return res
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  2.  Checksum & Signing (BUG-N07)                                         ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+def _sign_and_write(save_path: Path, work_data: bytearray, xor_key: bytes, header: bytes) -> int:
+    """
+    Centralized logic to sign, re-obfuscate and write an SRDR file.
+    Returns the new checksum value.
+    """
+    # 1. Recalculate JOAAT checksum on the modified deobfuscated payload (excluding the last 4 bytes)
+    payload_data = bytes(work_data[:-4])
+    new_checksum = joaat(payload_data)
+    checksum_bytes = struct.pack("<I", new_checksum)
+    
+    # 2. Append/replace the new checksum at the end of the deobfuscated payload
+    work_data[-4:] = checksum_bytes
+
+    # 3. Re-obfuscate with the same key (XOR is symmetric)
+    re_obfuscated = _xor_deobfuscate(bytes(work_data), xor_key)
+
+    # 4. Rebuild file: original header (untouched) + re-obfuscated payload
+    final_data = header + bytes(re_obfuscated)
+
+    with open(save_path, 'wb') as f:
+        f.write(final_data)
+    
+    return new_checksum
 
 
 def joaat(data: bytes) -> int:
@@ -194,35 +211,14 @@ def joaat(data: bytes) -> int:
 def validate_and_sign_srdr(file_path: Path) -> bool:
     """
     Validates a modified SRDR save file by recalculating its JOAAT signature.
-    The checksum is always stored as a 32-bit little-endian integer in the very
-    last 4 bytes of the deobfuscated payload.
     """
     try:
         with open(file_path, 'rb') as f:
             raw_data = f.read()
 
-        work_data, meta = handle_srdr_layers(raw_data, mode='decrypt')
+        plaintext, meta = handle_srdr_layers(raw_data, mode='decrypt')
         
-        # The data to be hashed is the entire deobfuscated payload minus the last 4 bytes
-        payload_data = bytes(work_data[:-4])
-        
-        # Calculate new JOAAT signature
-        new_checksum = joaat(payload_data)
-        
-        # Pack precisely as a 32-bit little-endian integer
-        checksum_bytes = struct.pack("<I", new_checksum)
-        
-        # Replace the last 4 bytes of the work data
-        work_data[-4:] = checksum_bytes
-
-        # Re-obfuscate payload
-        re_obfuscated = _xor_deobfuscate(bytes(work_data), meta['xor_key'])
-        
-        # Final file is original header + re-obfuscated payload
-        final_data = meta['original_header'] + bytes(re_obfuscated)
-        
-        with open(file_path, 'wb') as f:
-            f.write(final_data)
+        new_checksum = _sign_and_write(file_path, plaintext, meta['xor_key'], meta['original_header'])
             
         console.print(f"[bold green]✓ Checksum recalculated and updated ({hex(new_checksum)})[/bold green]")
         return True
@@ -230,6 +226,7 @@ def validate_and_sign_srdr(file_path: Path) -> bool:
     except Exception as e:
         console.print(f"[red]Failed to sign SRDR file: {e}[/red]")
         return False
+
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -468,11 +465,13 @@ def _patch_money(
     work_data: bytearray,
     money_amount: float,
     current_money: Optional[float],
+    force: bool = False, # BUG-N05: non-interactive mode
 ) -> bool:
     """
     Patches money in the deobfuscated save data using fuzzy-range scanning.
     Money is stored as int32 centimes (BUG-02, 03).
     """
+
     target_cents = int(round(money_amount * 100))
     if target_cents < 0 or target_cents > _MAX_CENTS:
         console.print(
@@ -494,10 +493,11 @@ def _patch_money(
         # No hint — broad scan of up to $100k
         console.print(
             "[cyan]No current money hint — broad-scanning all plausible "
-            "money values ($1–$100,000)...[/cyan]"
+            "money values ($0.01–$100,000)...[/cyan]"
         )
-        low_cents = 100
+        low_cents = 1 # BUG-N06: scan from 1 cent
         high_cents = _PLAUSIBLE_MONEY_MAX
+
 
     int_positions = _scan_int32_positions(work_data, low_cents, high_cents)
 
@@ -518,24 +518,35 @@ def _patch_money(
         )
         return False
 
-    # Build display lines for user selection
-    shown = min(10, len(all_candidates))
-    lines = []
-    for i, (display, count, _) in enumerate(all_candidates[:shown], 1):  # type: ignore
-        lines.append(f"{i:>2d}. ${display:>12.2f}  ({count:>4d} hits)")
+    # BUG-04 & BUG-N05: candidate selection
+    if force:
+        # Auto-pick the first one (usually the closest match due to sorting)
+        chosen_display, chosen_count, chosen_offsets = all_candidates[0]
+        console.print(f"[cyan]Force-selected candidate #1: ${chosen_display:.2f}[/cyan]")
+    else:
+        # Build display lines for user selection
+        shown = min(10, len(all_candidates))
+        lines = []
+        for i, (display, count, _) in enumerate(all_candidates[:shown], 1):
+            lines.append(f"{i:>2d}. ${display:>12.2f}  ({count:>4d} hits)")
 
-    idx = _prompt_candidate_choice("Money candidates found", lines, shown)
-    chosen_display, chosen_count, chosen_offsets = all_candidates[idx]
+        idx = _prompt_candidate_choice("Money candidates found", lines, shown)
+        chosen_display, chosen_count, chosen_offsets = all_candidates[idx]
 
     # BUG-04: Prevent blind patching of all occurrences if risky
-    if chosen_count > 10:
+    if chosen_count > 10 and not force:
         console.print(f"[yellow]Warning: {chosen_count} hits for this value. "
                       "Patching all might corrupt unrelated data.[/yellow]")
         confirm = Prompt.ask("Patch all occurrences? (y/N)", default="n")
         if confirm.lower() != "y":
             chosen_offsets = chosen_offsets[:1]
+    elif chosen_count > 10 and force:
+        # In force mode, we just patch the first one to be safe if too many hits
+        console.print(f"[yellow]Auto-patching: too many hits ({chosen_count}), limiting to first occurrence.[/yellow]")
+        chosen_offsets = chosen_offsets[:1]
 
     new_bytes = struct.pack('<i', target_cents) # BUG-03: Write as int32
+
 
     for pos in chosen_offsets:
         work_data[pos:pos + 4] = new_bytes
@@ -554,12 +565,14 @@ def _patch_honor(
     work_data: bytearray,
     honor_choice: str,
     current_honor: Optional[float],
+    force: bool = False, # BUG-N05: non-interactive mode
 ) -> bool:
     """
     Patches honor in the deobfuscated save data.
     Honor is stored as a signed int32 (BUG-06, 10).
     Typical range is ±320 or similar internally.
     """
+
     # Max honor values (empirical/documented)
     HONOR_MAX = 320
     HONOR_MIN = -320
@@ -593,21 +606,31 @@ def _patch_honor(
         )
         return False
 
-    # Build display lines
-    shown = min(10, len(filtered))
-    lines = []
-    for i, (val, count, _) in enumerate(filtered[:shown], 1):
-        lines.append(f"{i:>2d}. {val:>10.0f}  ({count:>4d} hits)")
+    # BUG-N05: candidate selection
+    if force:
+        chosen_val, chosen_count, chosen_offsets = filtered[0]
+        console.print(f"[cyan]Force-selected candidate #1: {chosen_val:.0f}[/cyan]")
+    else:
+        # Build display lines
+        shown = min(10, len(filtered))
+        lines = []
+        for i, (val, count, _) in enumerate(filtered[:shown], 1):
+            lines.append(f"{i:>2d}. {val:>10.0f}  ({count:>4d} hits)")
 
-    idx = _prompt_candidate_choice("Honor candidates found", lines, shown)
-    chosen_val, chosen_count, chosen_offsets = filtered[idx]
+        idx = _prompt_candidate_choice("Honor candidates found", lines, shown)
+        chosen_val, chosen_count, chosen_offsets = filtered[idx]
+
 
     # BUG-04: safety check
-    if chosen_count > 5:
+    if chosen_count > 5 and not force:
         console.print(f"[yellow]Warning: {chosen_count} hits for honor. Risk of corruption.[/yellow]")
         confirm = Prompt.ask("Patch all occurrences? (y/N)", default="n")
         if confirm.lower() != "y":
             chosen_offsets = chosen_offsets[:1]
+    elif chosen_count > 5 and force:
+        console.print(f"[yellow]Auto-patching: too many hits ({chosen_count}) for honor, limiting to first.[/yellow]")
+        chosen_offsets = chosen_offsets[:1]
+
 
     # Patch
     for pos in chosen_offsets:
@@ -641,11 +664,13 @@ def edit_save_file(
     honor_choice: Optional[str] = None,
     current_money: Optional[float] = None,
     current_honor: Optional[float] = None,
+    force: bool = False, # Pass through for non-interactive
 ) -> bool:
     """
     Edits an SRDR save file: deobfuscates, patches money/honor,
     re-obfuscates, updates checksum, writes back.
     """
+
     if _is_rdr2_running():
         console.print("[bold red]⚠ Red Dead Redemption 2 is currently running.[/bold red]")
         console.print("[yellow]Modifying saves while the game is open can lead to data loss or corruption.[/yellow]")
@@ -664,12 +689,21 @@ def edit_save_file(
         except OSError:
             break
 
-    bak_path = save_path.with_suffix(save_path.suffix + ".bak")
-    try:
-        shutil.copy2(save_path, bak_path)
-        console.print(f"Backup refreshed: {bak_path.name}")
-    except OSError as e:
-        console.print(f"[yellow]Warning: could not refresh backup: {e}[/yellow]")
+    # BUG-N10: improve bak path logic
+    pure_stem = save_path.name.split('.')[0]
+    bak_path = save_path.parent / (pure_stem + ".bak")
+    
+    # Avoid shutil.copy2 warning if save_path is already .bak
+    if bak_path.resolve() != save_path.resolve():
+        try:
+            shutil.copy2(save_path, bak_path)
+            console.print(f"Backup refreshed: {bak_path.name}")
+        except OSError as e:
+            console.print(f"[yellow]Warning: could not refresh backup: {e}[/yellow]")
+    else:
+        console.print("[dim]Save file is already a .bak, skipping self-backup.[/dim]")
+
+
 
     # BUG-12: Add microseconds to avoid collision on FAT32 (2s resolution)
     clone_ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -701,44 +735,31 @@ def edit_save_file(
     # ── Apply patches ────────────────────────────────────────────────────
     patched_any = False
     if money_amount is not None:
-        if _patch_money(work_data, money_amount, current_money):  # type: ignore
+        if _patch_money(work_data, money_amount, current_money, force=force):
             patched_any = True
 
     if honor_choice is not None:
-        if _patch_honor(work_data, honor_choice, current_honor):
+        if _patch_honor(work_data, honor_choice, current_honor, force=force):
             patched_any = True
+
 
     if not patched_any:
         console.print("[yellow]No changes made to save file.[/yellow]")
         return False
 
-    # ── Re-wrap: JOAAT Checksum, XOR re-obfuscate and write back ───────
+    # ── Re-wrap: JOAAT Checksum, XOR re-obfuscate and write back (BUG-N07) ──
     try:
-        # 1. Recalculate JOAAT checksum on the modified deobfuscated payload (excluding the last 4 bytes)
-        payload_data = bytes(work_data[:-4])
-        new_checksum = joaat(payload_data)
-        checksum_bytes = struct.pack("<I", new_checksum)
-        
-        # 2. Append/replace the new checksum at the end of the deobfuscated payload
-        work_data[-4:] = checksum_bytes
-
-        # 3. Re-obfuscate with the same key (XOR is symmetric)
-        re_obfuscated = _xor_deobfuscate(bytes(work_data), xor_key)
-
-        # 4. Rebuild file: original header (untouched) + re-obfuscated payload
-        final_data = header + bytes(re_obfuscated)
-
-        with open(save_path, 'wb') as f:
-            f.write(final_data)
+        new_checksum = _sign_and_write(save_path, work_data, xor_key, header)
 
         console.print(
-            f"[bold green]✓ Save file written ({len(final_data)} bytes). "
+            f"[bold green]✓ Save file written ({save_path.stat().st_size} bytes). "
             f"Signed with checksum {hex(new_checksum)}[/bold green]"
         )
         return True
 
     except Exception as e:
         console.print(f"[red]Failed to re-wrap save file: {e}[/red]")
+
         if bak_path.exists():
             try:
                 shutil.copy2(bak_path, save_path)

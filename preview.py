@@ -68,10 +68,10 @@ def setup_mock_environment():
             f.write(struct.pack("<i", 43218)) 
             
             f.seek(0x800)
-            f.write(struct.pack("<f", 150.0))
+            f.write(struct.pack("<i", 150)) # BUG-N08: honor is int32
         
-        # Call stub (no-op in save_modifier.py, but required by API contract)
-        rdr2_toolbox.validate_and_sign_srdr(save_file)
+        # BUG-N02: Do NOT call sign on a plain-text mock (corrupts end of file)
+        # rdr2_toolbox.validate_and_sign_srdr(save_file)
 
     rdr2_toolbox.set_simulation_mode(SIM_ROOT)
 
