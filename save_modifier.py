@@ -245,6 +245,14 @@ def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, D
     payload = data[_HEADER_LEN:]  # type: ignore
 
 
+    # Truncate payload to header-defined size to avoid padding issues at EOF
+    # Header offset 0x0C contains the expected payload size (including checksum)
+    expected_payload_len = struct.unpack('<I', header[12:16])[0]
+    if len(payload) > expected_payload_len:
+        payload = payload[:expected_payload_len]
+    elif len(payload) < expected_payload_len:
+        console.print(f"[yellow]Warning: payload size ({len(payload)}) less than header expectation ({expected_payload_len})[/yellow]")
+
     xor_key = _extract_xor_key(payload)
 
     plaintext = _xor_deobfuscate(payload, xor_key)
@@ -493,13 +501,8 @@ def _patch_money(
         )
         return False
     if force:
-        # Auto-pick the first one (usually the closest match due to sorting)
         chosen_display, chosen_count, chosen_offsets = all_candidates[0]
-        if chosen_count > 1:
-            console.print(f"[yellow]Force mode: found {chosen_count} hits, safely patching only the first occurrence.[/yellow]")
-            chosen_offsets = chosen_offsets[:1]
-        else:
-            console.print(f"[cyan]Force-selected candidate: ${chosen_display:.2f}[/cyan]")
+        console.print(f"[cyan]Force-selected candidate: ${chosen_display:.2f}[/cyan]")
     else:
         # Build display lines for user selection
         shown = min(10, len(all_candidates))
@@ -511,13 +514,7 @@ def _patch_money(
         chosen_display, chosen_count, chosen_offsets = all_candidates[idx]
 
     if chosen_count > 1 and not force:
-        console.print(f"[red]⚠ DANGER: Found {chosen_count} locations for this value. Patching all will corrupt your save![/red]")
-        confirm = Prompt.ask("Safely patch ONLY the first occurrence? (Y/n)", default="y")
-        if confirm.lower() != "n":
-            chosen_offsets = chosen_offsets[:1]
-        else:
-            console.print("[yellow]Aborting money patch to preserve save integrity.[/yellow]")
-            return False
+        console.print(f"[cyan]Notice: Found {chosen_count} locations for this value. Patching all for game state consistency.[/cyan]")
 
     new_bytes = struct.pack('<i', target_cents)
 
@@ -577,11 +574,7 @@ def _patch_honor(
 
     if force:
         chosen_val, chosen_count, chosen_offsets = filtered[0]
-        if chosen_count > 1:
-            console.print(f"[yellow]Force mode: found {chosen_count} hits for honor, safely patching only the first.[/yellow]")
-            chosen_offsets = chosen_offsets[:1]
-        else:
-            console.print(f"[cyan]Force-selected honor candidate: {chosen_val:.0f}[/cyan]")
+        console.print(f"[cyan]Force-selected honor candidate: {chosen_val:.0f}[/cyan]")
     else:
         # Build display lines
         shown = min(10, len(filtered))
@@ -593,13 +586,7 @@ def _patch_honor(
         chosen_val, chosen_count, chosen_offsets = filtered[idx]
 
     if chosen_count > 1 and not force:
-        console.print(f"[red]⚠ DANGER: Found {chosen_count} locations for this honor value.[/red]")
-        confirm = Prompt.ask("Safely patch ONLY the first occurrence? (Y/n)", default="y")
-        if confirm.lower() != "n":
-            chosen_offsets = chosen_offsets[:1]
-        else:
-            console.print("[yellow]Aborting honor patch to preserve save integrity.[/yellow]")
-            return False
+        console.print(f"[cyan]Notice: Found {chosen_count} locations for this honor value. Patching all for consistency.[/cyan]")
 
 
     for pos in chosen_offsets:
@@ -717,6 +704,16 @@ def edit_save_file(
             f"[bold green]✓ Save file written ({save_path.stat().st_size} bytes). "
             f"Signed with checksum {hex(new_checksum)}[/bold green]"
         )
+
+        # Fix Launcher Sync: Delete cloudsavedata.dat to force rebuild
+        cloud_file = save_path.parent / "cloudsavedata.dat"
+        if cloud_file.exists():
+            try:
+                cloud_file.unlink()
+                console.print("[dim]Cleared cloudsavedata.dat to prevent launcher sync corruption.[/dim]")
+            except Exception as e:
+                console.print(f"[yellow]Warning: Could not clear cloudsavedata.dat: {e}[/yellow]")
+
         return True
 
     except Exception as e:
