@@ -1289,9 +1289,11 @@ def install_local_mod_zip(zip_path: str, game_path: Path, prefix_path: Optional[
         if has_asi:
              for asi in asis:
                  try:
-                     if "lml" in Path(file_path).parts:
-                         asi.relative_to(tmp_path / "lml")
+                     # BUG-07: Fixed NameError (file_path was undefined).
+                     # Check if the .asi is already inside an 'lml' folder within the zip.
+                     asi.relative_to(tmp_path / "lml")
                  except ValueError:
+                     # If not in lml/, copy to the mod staging root.
                      shutil.copy2(asi, staging_mod_dir)
              console.print(f"[info]Detected {len(asis)} .asi file(s). Copied to staging.[/info]")
              

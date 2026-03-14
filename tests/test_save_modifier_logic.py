@@ -64,7 +64,9 @@ class TestSaveModifierLogic(unittest.TestCase):
         file_data = header + payload
         plaintext, meta = handle_srdr_layers(file_data)
         
-        self.assertEqual(bytes(plaintext), b"this is the real payload data!!!")
+        # After BUG-03 fix, we no longer strip padding. 
+        # The plaintext should include the trailing bytes matching the XOR key.
+        self.assertEqual(bytes(plaintext), real_data + (b"\x00" * 16 * 5))
         self.assertEqual(meta['xor_key'], key)
 
 if __name__ == '__main__':

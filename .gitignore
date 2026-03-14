@@ -18,3 +18,14 @@ token.txt
 release.sh
 delete_tag.sh
 tests/__pycache__
+build/
+dist/
+*.spec
+*.desktop
+*.rdr2cfg
+templates/
+static/
+build_binary.sh
+build_gui.sh
+gui_app.py
+build_standalone.sh

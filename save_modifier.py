@@ -166,42 +166,33 @@ def _sign_and_write(save_path: Path, work_data: bytearray, xor_key: bytes, heade
     """
     Centralized logic to sign, re-obfuscate and write an SRDR file atomically.
     Returns the new checksum value.
-    Note: copies work_data to avoid in-place mutation.
     """
-    signed_data = bytearray(work_data)
-    
-    # SM-C01: Fixed offset JOAAT checksum calculation
-    # We attempt to find the original checksum offset in common locations 
-    # to maintain consistency if not already known.
-    offset = _CHECKSUM_OFFSET_HINT
-    for test_offset in [0x00, 0x04, 0x08, 0x0C, 0x10]:
-        if test_offset + 4 <= len(signed_data):
-            orig_val = struct.unpack('<I', signed_data[test_offset:test_offset+4])[0]
-            # Temporarily zero for hash check
-            temp_data = bytearray(signed_data)
-            temp_data[test_offset:test_offset+4] = b'\x00\x00\x00\x00'
-            if joaat(bytes(temp_data)) == orig_val:
-                offset = test_offset
-                break
+    # BUG-01: Checksum must be written to the HEADER at offset 0x10, not the payload.
+    # BUG-02: Fixed offset 0x10 in header is the standard location for JOAAT checksum.
+    # BUG-04: Header at offset 0x08 must store the TOTAL file size.
 
-    # Guard against too small payload
-    if len(signed_data) < offset + 4:
-        raise RuntimeError(f"Payload too small ({len(signed_data)}) for checksum at 0x{offset:02X}")
+    # 1. Re-obfuscate the payload (work_data)
+    re_obfuscated = bytes(_xor_deobfuscate(bytes(work_data), xor_key))
 
-    # Zero out the checksum field before hashing
-    signed_data[offset:offset+4] = b'\x00\x00\x00\x00'
-    new_checksum = joaat(bytes(signed_data))
-    
-    # Pack the new checksum into the fixed offset
-    struct.pack_into("<I", signed_data, offset, new_checksum)
+    # 2. Prepare the modified header
+    new_header = bytearray(header)
 
-    re_obfuscated = _xor_deobfuscate(bytes(signed_data), xor_key)
-    final_data = header + bytes(re_obfuscated)
+    # 3. Calculate JOAAT checksum on the plaintext payload
+    # Note: RAGE engine calculates checksum on the deobfuscated payload.
+    new_checksum = joaat(bytes(work_data))
+
+    # 4. Write checksum to header offset 0x10
+    struct.pack_into("<I", new_header, 0x10, new_checksum)
+
+    # 5. Update total file size at header offset 0x08
+    total_size = len(new_header) + len(re_obfuscated)
+    struct.pack_into("<I", new_header, 0x08, total_size)
+
+    final_data = bytes(new_header) + re_obfuscated
 
     tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
     try:
-        with open(tmp_path, 'wb') as f:
-            f.write(final_data)
+        tmp_path.write_bytes(final_data)
         os.replace(tmp_path, save_path)
     except Exception as e:
         if tmp_path.exists():
@@ -277,14 +268,14 @@ def handle_srdr_layers(data: bytes, mode: str = 'decrypt') -> Tuple[bytearray, D
     # Note: Prior logic tried to truncate based on misread header description (SM-C03).
     # We now trust the actual file content size.
 
-    # Robust Padding Detection: Strip trailing 16-byte blocks that match the XOR key.
-    # These represent XOR-obfuscated null padding.
-    orig_len = len(payload)
-    while len(payload) >= 16 and payload[-16:] == xor_key:
-        payload = payload[:-16]
-    
-    if len(payload) < orig_len:
-        console.print(f"[dim]Stripped {orig_len - len(payload)} bytes of trailing XOR padding.[/dim]")
+    # BUG-03: Padding stripping is destructive and causes file size mismatch.
+    # We preserve the original length and alignment by NOT stripping XOR padding.
+    # orig_len = len(payload)
+    # while len(payload) >= 16 and payload[-16:] == xor_key:
+    #     payload = payload[:-16]
+    # 
+    # if len(payload) < orig_len:
+    #     console.print(f"[dim]Stripped {orig_len - len(payload)} bytes of trailing XOR padding.[/dim]")
 
     plaintext = _xor_deobfuscate(payload, xor_key)
     null_sample = sum(1 for b in plaintext[:4096] if b == 0)  # type: ignore
@@ -542,7 +533,9 @@ def _patch_money(
         all_candidates = [(cv / 100.0, len(o), o) for cv, o in int_positions.items()]
         
         if not all_candidates: return False
-        all_candidates.sort(key=lambda x: -x[1])
+        # BUG-05: The unique value is the correct one (occurrences = 1).
+        # Sort by occurrences ASCENDING.
+        all_candidates.sort(key=lambda x: x[1])
         
         chosen_display, chosen_count, chosen_offsets = all_candidates[0]
     else:
@@ -558,7 +551,8 @@ def _patch_money(
             all_candidates = [(cv / 100.0, len(o), [start + x for x in o]) for cv, o in int_positions.items()]
             
             if not all_candidates: return False
-            all_candidates.sort(key=lambda x: -x[1])
+            # BUG-05: Sort by occurrences ASCENDING.
+            all_candidates.sort(key=lambda x: x[1])
             
             chosen_display, chosen_count, chosen_offsets = all_candidates[0]
         else:
@@ -671,7 +665,6 @@ def _patch_honor(
     work_data[pos:pos + 4] = target_bytes
     console.print(f"[bold green]✓ Patched Honor at 0x{pos:08X}: {chosen_val:.0f} → {target_val}[/bold green]")
     return True
-    return True
 
 
 
@@ -688,7 +681,7 @@ def _is_rdr2_running() -> bool:
 def edit_save_file(
     save_path: Path,
     money_amount: Optional[float] = None,
-    honor_choice: Optional[str] = None,
+    honor_choice: Optional[float] = None,
     current_money: Optional[float] = None,
     current_honor: Optional[float] = None,
     force: bool = False,
